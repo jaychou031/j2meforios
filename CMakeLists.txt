@@ -15,6 +15,10 @@ set(NJ_ENABLE_MEDIA 1 CACHE STRING "" FORCE)
 set(NJ_PIXFMT NJ_PIXFMT_ARGB8888 CACHE STRING "" FORCE)
 set(NJ_THREADED_DISPATCH 1 CACHE STRING "" FORCE)
 add_subdirectory("${CORE}" core)
+# The upstream headless port defines _POSIX_C_SOURCE before sys/mman.h.
+# Darwin hides MAP_ANONYMOUS in that strict mode unless its extensions are
+# explicitly enabled. This port is compiled even with JIT disabled.
+target_compile_definitions(nj2me PRIVATE _DARWIN_C_SOURCE=1)
 set(DEMO "${UPSTREAM}/assets/korvo_demo.jar")
 set(CORE_LICENSE "${CORE}/LICENSE")
 set_source_files_properties("${DEMO}" "${CORE_LICENSE}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
