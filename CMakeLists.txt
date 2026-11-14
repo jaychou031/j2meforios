@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(J2MEForIOS VERSION 0.1.7 LANGUAGES C CXX OBJCXX)
+project(J2MEForIOS VERSION 0.1.8 LANGUAGES C CXX OBJCXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
   message(FATAL_ERROR "Configure with -DCMAKE_SYSTEM_NAME=iOS and an Apple toolchain")
 endif()

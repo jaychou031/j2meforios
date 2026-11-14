@@ -157,6 +157,7 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
 @interface GameController : UIViewController
 @property(nonatomic,copy) NSString *jarPath;
 @property(nonatomic,copy) NSString *saveID;
+@property(nonatomic,copy) void (^onFinish)(int status);
 @end
 @implementation GameController {
     NJSession *_session;
@@ -167,7 +168,7 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     NSTimeInterval _lastTime;
     NSTimeInterval _lastTickHost, _maxMainGap;
     NSUInteger _lastFrames;
-    BOOL _showFPS, _locked, _stopping, _previousPopEnabled, _savedPopState;
+    BOOL _showFPS, _locked, _stopping, _finished, _unexpectedDetach;
     session::Lifecycle _lifecycle;
     UIInterfaceOrientationMask _lockMask;
     float _volume;
@@ -223,18 +224,26 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     }];
     [_session startJar:_jarPath saveID:_saveID completion:^(int status){ [weakSelf finished:status]; }];
 }
-- (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.navigationController setNavigationBarHidden:YES animated:animated]; }
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    UIGestureRecognizer *pop=self.navigationController.interactivePopGestureRecognizer;
-    if(!_savedPopState) { _previousPopEnabled=pop.enabled; _savedPopState=YES; }
-    pop.enabled=NO;
     [self setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
-    [self.navigationController setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
 }
-- (void)viewWillDisappear:(BOOL)animated {
-    [super viewWillDisappear:animated];
-    if(_savedPopState) { self.navigationController.interactivePopGestureRecognizer.enabled=_previousPopEnabled; _savedPopState=NO; }
+- (void)dismissViewControllerAnimated:(BOOL)animated completion:(void (^)(void))completion {
+    // A back-gesture tweak may ask this controller to dismiss directly. Allow
+    // dismissal of our menu alert, but keep the game until its worker exits.
+    if(!_finished && !self.presentedViewController) return;
+    [super dismissViewControllerAnimated:animated completion:completion];
+}
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    // An ancestor or injected code can bypass our dismissal guard. Only an
+    // actual removal stops the VM; an alert, backgrounding or cancelled swipe
+    // must not end the game. Keep ownership until the worker's completion.
+    BOOL detached=!self.presentingViewController && !self.parentViewController && !self.view.window;
+    if(!_finished && (self.isBeingDismissed || self.isMovingFromParentViewController || detached)) {
+        _unexpectedDetach=YES;
+        [self stopGame];
+    }
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews]; CGRect safe=UIEdgeInsetsInsetRect(self.view.bounds,self.view.safeAreaInsets);
@@ -263,6 +272,7 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
 - (void)applyLifecycle {
     _lastTickHost=0;
     _timer.paused=_lifecycle.pauseVM();
+    if(_stopping) return; // never re-park the worker after stop woke it for teardown
     [_session setAudioAvailable:_lifecycle.audioAvailable];
     [_session setPaused:_lifecycle.pauseVM()];
 }
@@ -283,6 +293,13 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     else [self active];
 }
 - (void)resume { _lifecycle.menu=false; [self active]; }
+- (void)stopGame {
+    if(_stopping || _finished) return;
+    _stopping=YES; _lifecycle.stopping=true;
+    _timer.paused=YES; [_surface releaseTouches]; _toolbar.userInteractionEnabled=NO;
+    // stop wakes a paused worker so destroyApp and audio teardown can finish.
+    [_session stop];
+}
 - (void)menu {
     if(_stopping) return;
     [_surface releaseTouches]; _lifecycle.menu=true; [self applyLifecycle];
@@ -294,31 +311,51 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
         [UIViewController attemptRotationToDeviceOrientation]; [self resume];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"结束并返回游戏列表" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *){
-        self->_stopping=YES; self->_lifecycle.stopping=true; self->_toolbar.userInteractionEnabled=NO; [self->_session stop];
+        [self stopGame];
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
 - (void)finished:(int)status {
+    if(_finished) return;
+    _finished=YES; _stopping=YES; _lifecycle.stopping=true;
     [_timer invalidate]; _timer=nil; [_surface releaseTouches];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     UIApplication.sharedApplication.idleTimerDisabled=NO;
     [AVAudioSession.sharedInstance setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
     NSString *path=[documents() stringByAppendingPathComponent:@"latest-session.log"];
-    NSString *log=[_session.logText stringByAppendingFormat:@"%@UI_MAIN max_tick_gap_ms=%.2f\nAPP_VERSION=%@ BUILD=%@\n",
-        [_surface inputDiagnostics],_maxMainGap*1000.0,
+    NSString *log=[_session.logText stringByAppendingFormat:@"%@UI_MAIN max_tick_gap_ms=%.2f\nUI_EXIT unexpected_detach=%d\nAPP_VERSION=%@ BUILD=%@\n",
+        [_surface inputDiagnostics],_maxMainGap*1000.0,(int)_unexpectedDetach,
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]];
     [log writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    if(self.presentedViewController) [self dismissViewControllerAnimated:NO completion:nil];
-    UIViewController *library=self.navigationController.viewControllers.firstObject;
-    [self.navigationController popViewControllerAnimated:NO];
-    if(status<0) message(library,@"游戏运行失败",[NSString stringWithFormat:@"错误码 %d。请从游戏列表导出运行日志。",status]);
+    [self returnToLibrary:status];
+}
+- (void)returnToLibrary:(int)status {
+    // The menu may still be animating away when a fast worker finishes. Wait
+    // for that transition (or an external dismissal), then close the full
+    // presentation chain in one operation instead of racing two dismissals.
+    id<UIViewControllerTransitionCoordinator> transition=self.presentedViewController.transitionCoordinator ?: self.transitionCoordinator;
+    if(transition && [transition animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
+        (void)context;
+        dispatch_async(dispatch_get_main_queue(),^{ [self returnToLibrary:status]; });
+    }]) return;
+    void (^done)(void)=^{
+        void (^callback)(int)=self.onFinish;
+        self.onFinish=nil;
+        if(callback) callback(status);
+    };
+    UIViewController *presenter=self.presentingViewController;
+    if(presenter && presenter.presentedViewController==self) [presenter dismissViewControllerAnimated:NO completion:done];
+    else done(); // already removed externally; never dismiss another screen
 }
 @end
 
 @interface LibraryController : UITableViewController <UIDocumentPickerDelegate>
 @end
-@implementation LibraryController { NSArray<NSDictionary *> *_games; }
+@implementation LibraryController {
+    NSArray<NSDictionary *> *_games;
+    GameController *_activeGame; // retains the session even after a forced dismissal
+}
 - (void)viewDidLoad {
     [super viewDidLoad]; self.title=@"掌上 J2ME";
     self.navigationItem.rightBarButtonItem=[[UIBarButtonItem alloc] initWithTitle:@"导入 JAR" style:UIBarButtonItemStylePlain target:self action:@selector(importJar)];
@@ -403,9 +440,32 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
 }
 - (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)path {
     [table deselectRowAtIndexPath:path animated:YES];
+    if(_activeGame || self.presentedViewController || self.navigationController.presentedViewController) return;
     NSDictionary *game=_games[path.row]; GameController *vc=[GameController new];
     vc.jarPath=game[@"path"]; vc.saveID=game[@"id"]; vc.title=game[@"title"];
-    [self.navigationController pushViewController:vc animated:YES];
+    // Keep the game OUT of the library's navigation stack. Full-screen return
+    // tweaks can add their own pop recognizer, ignoring interactivePop.enabled.
+    vc.modalPresentationStyle=UIModalPresentationFullScreen;
+    vc.modalInPresentation=YES;
+    vc.modalPresentationCapturesStatusBarAppearance=YES;
+    __weak LibraryController *weakSelf=self;
+    vc.onFinish=^(int status) {
+        LibraryController *owner=weakSelf;
+        if(!owner) return;
+        owner->_activeGame=nil;
+        [owner updateGameAvailability];
+        if(status<0) message(owner,@"游戏运行失败",[NSString stringWithFormat:@"错误码 %d。请从游戏列表导出运行日志。",status]);
+    };
+    _activeGame=vc; [self updateGameAvailability];
+    [self presentViewController:vc animated:NO completion:nil];
+}
+- (void)updateGameAvailability {
+    // A forced return must not launch a second VM or modify its storage while
+    // the first worker is still destroying the game and closing audio.
+    BOOL available=_activeGame==nil;
+    self.view.userInteractionEnabled=available;
+    self.navigationItem.leftBarButtonItem.enabled=available;
+    self.navigationItem.rightBarButtonItem.enabled=available;
 }
 - (void)importJar {
     UIDocumentPickerViewController *picker=[[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData] asCopy:YES];
