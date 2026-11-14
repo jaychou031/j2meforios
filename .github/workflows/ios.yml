@@ -1,0 +1,53 @@
+name: Build iOS IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned source revision
+        id: source
+        run: |
+          python3 -c 'import json; d=json.load(open("upstream.lock.json")); print("revision=" + d["commit"])' >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: lucinhu/esp32s31-korvo-nano-j2me
+          ref: ${{ steps.source.outputs.revision }}
+          submodules: recursive
+          path: upstream/esp32s31-korvo-nano-j2me
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Test portable input and layout
+        run: |
+          mkdir -p build
+          clang++ -std=c++17 -Wall -Wextra -Werror tests/controls_test.cpp -o build/controls-test
+          build/controls-test
+          python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Build device application and package IPA
+        run: bash scripts/build-ios.sh 2>&1 | tee build-ios.log
+      - name: Run actual core demo and persistence smoke test
+        run: |
+          cmake -S upstream/esp32s31-korvo-nano-j2me/third_party/nano_j2me -B build/core-host \
+            -DNJ_BUILD_TESTS=OFF -DNJ_BUILD_SDL2=OFF -DNJ_BUILD_CLI=ON \
+            -DNJ_BUILD_LIBRETRO=OFF -DNJ_BUILD_EMBEDDED_PORTS=OFF \
+            -DNJ_BUILD_POSIX_NETWORK=OFF -DNJ_ENABLE_MEDIA=1 \
+            -DNJ_PIXFMT=NJ_PIXFMT_ARGB8888
+          cmake --build build/core-host --target nj2me-cli --parallel 3
+          python3 scripts/smoke-core.py build/core-host/nj2me
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: J2MEForIOS-build
+          path: |
+            dist/*.ipa
+            build-ios.log
+            build/demo-boot-*.log
+          if-no-files-found: warn
+
