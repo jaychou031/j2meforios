@@ -4,6 +4,7 @@
 #include "InputQueue.hpp"
 #include "ToneSample.hpp"
 #include "SoundFontSynth.h"
+#include "SessionLifecycle.hpp"
 #import "GameStorage.h"
 #include "nj_posix_dir.h"
 #include <condition_variable>
@@ -24,7 +25,9 @@ struct State {
     std::condition_variable condition;
     controls::InputQueue input;
     bool stop=false, paused=false, dirty=false, inputWake=false;
-    int width,height;
+    bool audioAvailable=true, audioPaused=false, toneWasPlaying=false;
+    session::Clock clock;
+    int width,height, frameRate=60;
     float volume=0.7f;
     float appliedVolume=-1;
     std::atomic<NSUInteger> frames{0};
@@ -36,22 +39,35 @@ struct State {
     nj_sf_stats soundfontStart{};
     explicit State(int w,int h):width(w),height(h),pixels(w*h),snapshot(w*h) {}
 };
-static nj_u4 millis(void *) {
-    return (nj_u4)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+static uint64_t hostMillis() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static nj_u4 millis(void *ud) {
+    if(!ud) return (nj_u4)hostMillis(); // Input diagnostics use real elapsed time.
+    auto *s=(State *)ud;
+    std::lock_guard<std::mutex> guard(s->lock);
+    return (nj_u4)s->clock.now(hostMillis());
 }
 static void yieldVM(void *ud) {
     auto *s=(State *)ud;
-    std::unique_lock<std::mutex> guard(s->lock);
-    float volume=s->volume;
-    bool park=s->paused && !s->stop;
-    guard.unlock();
-    if(volume!=s->appliedVolume) {
-        s->audio.volume(volume); s->tone.volume=volume; s->appliedVolume=volume;
-    }
-    if(park) {
-        s->audio.pause(true); [s->tone pause];
-        guard.lock(); s->condition.wait(guard,[s]{return !s->paused || s->stop;}); guard.unlock();
-        s->audio.pause(false); [s->tone play];
+    for(;;) {
+        std::unique_lock<std::mutex> guard(s->lock);
+        float volume=s->volume;
+        bool park=s->paused && !s->stop;
+        bool audioPause=park || !s->audioAvailable || s->stop;
+        guard.unlock();
+        if(volume!=s->appliedVolume) {
+            s->audio.volume(volume); s->tone.volume=volume; s->appliedVolume=volume;
+        }
+        if(audioPause!=s->audioPaused) {
+            s->audioPaused=audioPause;
+            s->audio.pause(audioPause);
+            if(audioPause) { s->toneWasPlaying=s->tone.playing; [s->tone pause]; }
+            else if(s->toneWasPlaying) { [s->tone play]; s->toneWasPlaying=false; }
+        }
+        if(!park) return;
+        guard.lock(); s->condition.wait(guard,[s]{return !s->paused || s->stop;});
+        // Loop re-reads both gates after the wait, including forced quit.
     }
 }
 static void sleepVM(void *ud,nj_u4 ms) {
@@ -101,14 +117,21 @@ static int pcmOpen(void *ud,int rate,int channels) {
     float volume;
     { std::lock_guard<std::mutex> guard(s->lock); volume=s->volume; }
     int result=s->audio.open(rate,channels);
-    if(result==0) s->audio.volume(volume); // apply before the first audible buffer
+    if(result==0) { s->audio.volume(volume); s->audio.pause(s->audioPaused); }
     return result;
 }
 static int pcmWrite(void *ud,const nj_s2 *p,int n) { return ((State *)ud)->audio.write(p,n); }
 static int pcmFree(void *ud) { return ((State *)ud)->audio.freeFrames(); }
 static int pcmQueued(void *ud) { return ((State *)ud)->audio.queuedFrames(); }
-static void pcmClose(void *ud) { ((State *)ud)->audio.close(); }
-static void toneStop(void *ud) { auto *s=(State *)ud; [s->tone stop]; s->tone=nil; }
+static void pcmClose(void *ud) {
+    auto *s=(State *)ud; s->audio.close(); auto a=s->audio.stats();
+    char line[256];
+    snprintf(line,sizeof(line),"PCM_CLOSE rate=%d written=%llu played=%llu gaps=%llu gap_silence_frames=%llu last_error=%d",
+        a.rate,(unsigned long long)a.written,(unsigned long long)a.played,
+        (unsigned long long)a.starvationGaps,(unsigned long long)a.gapSilenceFrames,a.lastError);
+    logVM(s,2,line);
+}
+static void toneStop(void *ud) { auto *s=(State *)ud; [s->tone stop]; s->tone=nil; s->toneWasPlaying=false; }
 static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
     auto *s=(State *)ud; toneStop(ud);
     if(!tones || count<1 || count>4096) return -1;
@@ -128,6 +151,7 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
     float volume;
     { std::lock_guard<std::mutex> guard(s->lock); volume=s->volume; }
     s->tone.volume=volume;
+    if(s->audioPaused && s->tone) { s->toneWasPlaying=true; [s->tone prepareToPlay]; return 0; }
     return s->tone && [s->tone play]?0:-1;
 }
 
@@ -168,11 +192,14 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
             port.dir_open=nj_posix_dir_open; port.dir_next=nj_posix_dir_next; port.dir_close=nj_posix_dir_close;
             port.pcm_open=pcmOpen; port.pcm_write=pcmWrite; port.pcm_close=pcmClose;
             port.pcm_free=pcmFree; port.pcm_queued=pcmQueued;
-            port.tone_play=tonePlay; port.tone_stop=toneStop; port.fps_cap=60;
+            port.tone_play=tonePlay; port.tone_stop=toneStop; port.fps_cap=s->frameRate;
+            logVM(s,2,s->frameRate==30?"POWER frame_cap=30":"POWER frame_cap=60");
             nj_run_opts options={}; options.jar_path=path.UTF8String;
             options.heap_bytes=32u*1024u*1024u; options.device=nj_device_find("nokia6230");
             options.stats=1;
             int result=nj_run(&port,&options);
+            unsigned released=nj_sf_release_thread_streams();
+            if(released) { char text[96]; snprintf(text,sizeof(text),"SOUNDFONT teardown released %u unclosed streams",released); logVM(s,2,text); }
             s->audio.close(); toneStop(s);
             dispatch_async(dispatch_get_main_queue(),^{ completion(result); });
         }
@@ -189,18 +216,27 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
     }
     _state->condition.notify_one();
 }
-- (void)stop { std::lock_guard<std::mutex> guard(_state->lock); _state->stop=true; _state->paused=false; _state->condition.notify_all(); }
-- (void)setPaused:(BOOL)paused { std::lock_guard<std::mutex> guard(_state->lock); _state->paused=paused; _state->condition.notify_all(); }
+- (void)stop { std::lock_guard<std::mutex> guard(_state->lock); _state->stop=true; _state->paused=false; _state->clock.setPaused(false,hostMillis()); _state->condition.notify_all(); }
+- (void)setPaused:(BOOL)paused {
+    { std::lock_guard<std::mutex> guard(_state->lock); _state->paused=paused; _state->clock.setPaused(paused,hostMillis()); _state->condition.notify_all(); }
+    logVM(_state,2,paused?"LIFECYCLE vm_paused":"LIFECYCLE vm_resumed");
+}
+- (void)setAudioAvailable:(BOOL)available {
+    { std::lock_guard<std::mutex> guard(_state->lock); _state->audioAvailable=available; _state->condition.notify_all(); }
+    logVM(_state,2,available?"LIFECYCLE audio_available":"LIFECYCLE audio_interrupted");
+}
 - (void)setVolume:(float)volume { std::lock_guard<std::mutex> guard(_state->lock); _state->volume=volume; }
+- (void)setFrameRate:(NSInteger)frameRate { NSAssert(!_started,@"Set frame rate before starting the VM"); _state->frameRate=frameRate==30?30:60; }
 - (NSUInteger)frameCount { return _state->frames.load(std::memory_order_relaxed); }
 - (NSString *)logText {
     NSString *text;
     nj_sf_stats baseline;
     { std::lock_guard<std::mutex> guard(_state->logLock); text=[_state->logs copy]; baseline=_state->soundfontStart; }
     auto sound=_state->audio.stats();
-    text=[text stringByAppendingFormat:@"\nAUDIO rate=%d written=%llu played=%llu empty_frames=%llu saturated_samples=%llu peak_frames=%d last_error=%d\n",
+    text=[text stringByAppendingFormat:@"\nAUDIO rate=%d written=%llu played=%llu empty_frames=%llu saturated_samples=%llu peak_frames=%d last_error=%d gaps=%llu gap_silence_frames=%llu\n",
         sound.rate,(unsigned long long)sound.written,(unsigned long long)sound.played,
-        (unsigned long long)sound.underrunFrames,(unsigned long long)sound.clippedSamples,sound.peak,sound.lastError];
+        (unsigned long long)sound.underrunFrames,(unsigned long long)sound.clippedSamples,sound.peak,sound.lastError,
+        (unsigned long long)sound.starvationGaps,(unsigned long long)sound.gapSilenceFrames];
     auto sf=nj_sf_get_stats();
     text=[text stringByAppendingFormat:@"AUDIO_MIDI soundfont_streams=%llu waveform_fallbacks=%llu limited_samples=%llu errors=%llu active_streams=%llu\n",
         (unsigned long long)(sf.opened-baseline.opened),(unsigned long long)(sf.fallback-baseline.fallback),

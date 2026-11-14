@@ -7,6 +7,8 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <vector>
+#include <algorithm>
 
 namespace {
 constexpr unsigned rate = 22050, block = 64;
@@ -52,6 +54,7 @@ struct Synth {
         return c.font;
     }
 };
+thread_local std::vector<Synth *> ownedStreams;
 }
 
 extern "C" int nj_sf_load_bank(const char *path) {
@@ -69,11 +72,22 @@ extern "C" void *nj_sf_create(void) {
         s->seed = tsf_copy(bank);
     }
     if (!s || !s->seed) { delete s; ++fallback; return nullptr; }
+    ownedStreams.push_back(s);
     ++opened; ++active;
     return s;
 }
 extern "C" void nj_sf_destroy(void *ptr) {
-    if (ptr) { delete static_cast<Synth *>(ptr); --active; }
+    if (ptr) {
+        auto *s=static_cast<Synth *>(ptr);
+        auto at=std::find(ownedStreams.begin(),ownedStreams.end(),s);
+        if(at!=ownedStreams.end()) ownedStreams.erase(at);
+        delete s; --active;
+    }
+}
+extern "C" unsigned nj_sf_release_thread_streams(void) {
+    unsigned count=(unsigned)ownedStreams.size();
+    while(!ownedStreams.empty()) nj_sf_destroy(ownedStreams.back());
+    return count;
 }
 extern "C" void nj_sf_note(void *ptr, int ch, int key, int velocity, int on) {
     auto *f = static_cast<Synth *>(ptr)->channel(ch);

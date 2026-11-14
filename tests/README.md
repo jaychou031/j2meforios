@@ -40,3 +40,9 @@ actual device bundle before packaging. None of these checks replace device audio
 test_git_audio.py reproduces core.autocrlf=true altering the original header,
 then verifies all pinned files survive re-staging and an LF-default checkout
 with the project .gitattributes. All test repositories stay under build/tmp.
+
+lifecycle_test.cpp checks VM/audio pause separation and the paused game clock.
+audio_queue_test.cpp compiles the actual AudioOutput against a small fake queue;
+it checks exact PCM order, no idle silent-buffer loop, pause/restart and callbacks
+during synchronous disposal. The fake is not an Apple driver or UIKit emulator.
+SoundFont tests also cover per-worker final cleanup and isolation from other threads.

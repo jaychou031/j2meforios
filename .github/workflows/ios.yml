@@ -34,6 +34,10 @@ jobs:
           build/input-queue-test
           clang++ -std=c++17 -Wall -Wextra -Werror tests/pcm_buffer_test.cpp -o build/pcm-buffer-test
           build/pcm-buffer-test
+          clang++ -std=c++17 -Wall -Wextra -Werror tests/lifecycle_test.cpp -o build/lifecycle-test
+          build/lifecycle-test
+          clang++ -std=c++17 -Wall -Wextra -Werror -x c++ -Itests/audio_queue_fake ios/AudioOutput.mm tests/audio_queue_test.cpp -o build/audio-queue-test
+          build/audio-queue-test
           mkdir -p build/tmp
           clang++ -std=c++17 -fobjc-arc -framework Foundation tests/storage_test.mm ios/GameStorage.mm -o build/storage-test
           build/storage-test build/tmp

@@ -8,6 +8,7 @@ extern "C" {
 #include <cstring>
 #include <set>
 #include <vector>
+#include <thread>
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"Failed: %s at %d\n",#x,__LINE__); std::exit(1); } } while(0)
 static std::set<void *> allocations;
@@ -105,5 +106,15 @@ int main(int argc,char **argv) {
     CHECK(allocations.empty());
     auto stats=nj_sf_get_stats(); CHECK(stats.active==0 && stats.opened>=7 && stats.fallback==1);
     CHECK(stats.errors==0);
+    // Some games leave Players open. Final cleanup is scoped to the VM worker.
+    CHECK(nj_sf_create());
+    std::thread worker([] {
+        CHECK(nj_sf_create()); CHECK(nj_sf_create());
+        CHECK(nj_sf_release_thread_streams()==2);
+    });
+    worker.join();
+    CHECK(nj_sf_get_stats().active==1);
+    CHECK(nj_sf_release_thread_streams()==1);
+    CHECK(nj_sf_get_stats().active==0);
     std::puts("SoundFont: fallback, stereo, seek/restart, rate/tempo, MIDIControl, instruments/drums/effects, cleanup passed.");
 }

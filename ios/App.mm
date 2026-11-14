@@ -6,6 +6,7 @@
 #import "NJSession.h"
 #import "GameStorage.h"
 #include "Controls.hpp"
+#include "SessionLifecycle.hpp"
 
 static NSString *documents() { return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject; }
 static CGRect cg(controls::Rect r) { return CGRectMake(r.x,r.y,r.w,r.h); }
@@ -38,6 +39,8 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     CGFloat _layoutScale;
     NSUInteger _touchSamples;
     double _touchDelayTotal, _touchDelayMax;
+    NSUInteger _edgeSamples;
+    double _edgeDelayTotal, _edgeDelayMax;
 }
 @synthesize gameImage=_gameImage;
 - (instancetype)init {
@@ -133,12 +136,18 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     for(UITouch *touch in t) {
         double delay=MAX(0.0,(now-touch.timestamp)*1000.0);
         ++_touchSamples; _touchDelayTotal+=delay; _touchDelayMax=MAX(_touchDelayMax,delay);
+        CGPoint p=[touch locationInView:self.window];
+        CGSize size=self.window.bounds.size;
+        if(p.x<24 || p.x>size.width-24 || p.y>size.height-24) {
+            ++_edgeSamples; _edgeDelayTotal+=delay; _edgeDelayMax=MAX(_edgeDelayMax,delay);
+        }
     }
     [self updateTouches:t ending:NO];
 }
 - (NSString *)inputDiagnostics {
-    return [NSString stringWithFormat:@"UI_TOUCH samples=%lu average_delivery_ms=%.2f max_delivery_ms=%.2f\n",
-        (unsigned long)_touchSamples,_touchSamples?_touchDelayTotal/_touchSamples:0.0,_touchDelayMax];
+    return [NSString stringWithFormat:@"UI_TOUCH samples=%lu average_delivery_ms=%.2f max_delivery_ms=%.2f edge_samples=%lu edge_average_ms=%.2f edge_max_ms=%.2f\n",
+        (unsigned long)_touchSamples,_touchSamples?_touchDelayTotal/_touchSamples:0.0,_touchDelayMax,
+        (unsigned long)_edgeSamples,_edgeSamples?_edgeDelayTotal/_edgeSamples:0.0,_edgeDelayMax];
 }
 - (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { (void)e; [self updateTouches:t ending:NO]; }
 - (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { (void)e; [self updateTouches:t ending:YES]; }
@@ -158,11 +167,13 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     NSTimeInterval _lastTime;
     NSTimeInterval _lastTickHost, _maxMainGap;
     NSUInteger _lastFrames;
-    BOOL _showFPS, _locked, _stopping, _audioInterrupted;
+    BOOL _showFPS, _locked, _stopping, _previousPopEnabled, _savedPopState;
+    session::Lifecycle _lifecycle;
     UIInterfaceOrientationMask _lockMask;
     float _volume;
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
+- (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return _locked?_lockMask:UIInterfaceOrientationMaskAllButUpsideDown; }
 - (UIButton *)button:(NSString *)title action:(SEL)selector {
     UIButton *b=[UIButton buttonWithType:UIButtonTypeSystem]; [b setTitle:title forState:UIControlStateNormal];
@@ -176,6 +187,8 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     const int widths[]={240,176,128,320}, heights[]={320,208,160,240};
     resolution=std::clamp(resolution,0,3);
     _session=[[NJSession alloc] initWithWidth:widths[resolution] height:heights[resolution]];
+    BOOL powerSave=[defaults boolForKey:@"powerSave"] || NSProcessInfo.processInfo.lowPowerModeEnabled;
+    [_session setFrameRate:powerSave?30:60];
     _volume=[defaults floatForKey:@"volume"]; [_session setVolume:_volume];
     _surface=[GameSurface new]; _surface.session=_session; _surface.pixel=[defaults boolForKey:@"pixel"];
     [self.view addSubview:_surface];
@@ -187,14 +200,31 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(audioInterrupted:) name:AVAudioSessionInterruptionNotification object:nil];
     NSError *error=nil;
     [AVAudioSession.sharedInstance setCategory:AVAudioSessionCategoryPlayback error:&error];
-    [AVAudioSession.sharedInstance setActive:YES error:&error];
+    _lifecycle.active=UIApplication.sharedApplication.applicationState==UIApplicationStateActive;
+    _lifecycle.audioAvailable=[AVAudioSession.sharedInstance setActive:YES error:&error];
+    [_session setAudioAvailable:_lifecycle.audioAvailable];
+    [_session setPaused:_lifecycle.pauseVM()];
     _timer=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+    _timer.preferredFramesPerSecond=powerSave?30:60;
     [_timer addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    _timer.paused=_lifecycle.pauseVM();
     UIApplication.sharedApplication.idleTimerDisabled=YES;
     __weak GameController *weakSelf=self;
     [_session startJar:_jarPath saveID:_saveID completion:^(int status){ [weakSelf finished:status]; }];
 }
 - (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.navigationController setNavigationBarHidden:YES animated:animated]; }
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    UIGestureRecognizer *pop=self.navigationController.interactivePopGestureRecognizer;
+    if(!_savedPopState) { _previousPopEnabled=pop.enabled; _savedPopState=YES; }
+    pop.enabled=NO;
+    [self setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
+    [self.navigationController setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
+}
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    if(_savedPopState) { self.navigationController.interactivePopGestureRecognizer.enabled=_previousPopEnabled; _savedPopState=NO; }
+}
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews]; CGRect safe=UIEdgeInsetsInsetRect(self.view.bounds,self.view.safeAreaInsets);
     _toolbar.frame=CGRectMake(safe.origin.x,safe.origin.y,safe.size.width,44);
@@ -208,32 +238,41 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     if(timer.timestamp-_lastTime>=0.5) {
         NSUInteger count=_session.frameCount;
         double fps=_lastTime?(count-_lastFrames)/(timer.timestamp-_lastTime):0;
-        [_fps setTitle:_showFPS?[NSString stringWithFormat:@"%.0f FPS",fps]:@"FPS 关" forState:UIControlStateNormal];
+        if(_showFPS) [_fps setTitle:[NSString stringWithFormat:@"%.0f FPS",fps] forState:UIControlStateNormal];
         _lastFrames=count; _lastTime=timer.timestamp;
     }
 }
 - (void)scale { _surface.pixel=!_surface.pixel; [NSUserDefaults.standardUserDefaults setBool:_surface.pixel forKey:@"pixel"]; }
-- (void)toggleFPS { _showFPS=!_showFPS; [NSUserDefaults.standardUserDefaults setBool:_showFPS forKey:@"fps"]; }
+- (void)toggleFPS { _showFPS=!_showFPS; if(!_showFPS) [_fps setTitle:@"FPS 关" forState:UIControlStateNormal]; [NSUserDefaults.standardUserDefaults setBool:_showFPS forKey:@"fps"]; }
 - (void)volumeBy:(float)delta { _volume=std::clamp(_volume+delta,0.0f,1.0f); [_session setVolume:_volume]; [NSUserDefaults.standardUserDefaults setFloat:_volume forKey:@"volume"]; }
 - (void)quieter { [self volumeBy:-0.1f]; }
 - (void)louder { [self volumeBy:0.1f]; }
-- (void)inactive { _lastTickHost=0; [_surface releaseTouches]; [_session setPaused:YES]; }
+- (void)applyLifecycle {
+    _lastTickHost=0;
+    _timer.paused=_lifecycle.pauseVM();
+    [_session setAudioAvailable:_lifecycle.audioAvailable];
+    [_session setPaused:_lifecycle.pauseVM()];
+}
+- (void)inactive { _lastTickHost=0; [_surface releaseTouches]; _lifecycle.active=false; [self applyLifecycle]; }
 - (void)notificationInactive:(NSNotification *)notification { (void)notification; [self inactive]; }
 - (void)notificationActive:(NSNotification *)notification { (void)notification; [self active]; }
 - (void)active {
     _lastTickHost=0;
-    if(!_audioInterrupted && !self.presentedViewController && !_stopping) {
-        [AVAudioSession.sharedInstance setActive:YES error:nil]; [_session setPaused:NO];
-    }
+    _lifecycle.active=UIApplication.sharedApplication.applicationState==UIApplicationStateActive;
+    // A suspended app may never receive interruption-ended. Foreground entry
+    // always retries activation; failure gates audio, never strands the VM.
+    if(_lifecycle.active && !_stopping) _lifecycle.audioAvailable=[AVAudioSession.sharedInstance setActive:YES error:nil];
+    [self applyLifecycle];
 }
 - (void)audioInterrupted:(NSNotification *)notification {
-    _audioInterrupted=[notification.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue]==AVAudioSessionInterruptionTypeBegan;
-    if(_audioInterrupted) [self inactive]; else [self active];
+    BOOL began=[notification.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue]==AVAudioSessionInterruptionTypeBegan;
+    if(began) { _lifecycle.audioAvailable=false; [_surface releaseTouches]; [self applyLifecycle]; }
+    else [self active];
 }
-- (void)resume { if(UIApplication.sharedApplication.applicationState==UIApplicationStateActive && !_audioInterrupted) [_session setPaused:NO]; }
+- (void)resume { _lifecycle.menu=false; [self active]; }
 - (void)menu {
     if(_stopping) return;
-    [self inactive];
+    [_surface releaseTouches]; _lifecycle.menu=true; [self applyLifecycle];
     UIAlertController *a=[UIAlertController alertControllerWithTitle:self.title message:[NSString stringWithFormat:@"音量 %.0f%% · %@ · %d×%d",_volume*100,_surface.pixel?@"整数倍":@"最大尺寸",_session.width,_session.height] preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"继续游戏" style:UIAlertActionStyleCancel handler:^(UIAlertAction *){[self resume];}]];
     [a addAction:[UIAlertAction actionWithTitle:_locked?@"解除方向锁定":@"锁定当前方向" style:UIAlertActionStyleDefault handler:^(UIAlertAction *){
@@ -242,7 +281,7 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
         [UIViewController attemptRotationToDeviceOrientation]; [self resume];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"结束并返回游戏列表" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *){
-        self->_stopping=YES; self->_toolbar.userInteractionEnabled=NO; [self->_session stop];
+        self->_stopping=YES; self->_lifecycle.stopping=true; self->_toolbar.userInteractionEnabled=NO; [self->_session stop];
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
@@ -385,10 +424,12 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     [self reload]; if(errors.count) message(self,@"部分文件未导入",[errors componentsJoinedByString:@"\n"]);
 }
 - (void)settings {
-    UIAlertController *a=[UIAlertController alertControllerWithTitle:@"设置" message:@"游戏逻辑分辨率在下次启动时生效。横竖屏只改变界面布局。" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *a=[UIAlertController alertControllerWithTitle:@"设置" message:@"分辨率和省电模式在下次启动游戏时生效。省电模式限制为 30 FPS；系统低电量模式也会启用此限制。横竖屏只改变界面布局。" preferredStyle:UIAlertControllerStyleAlert];
     NSArray *resolutions=@[@"240 × 320",@"176 × 208",@"128 × 160",@"320 × 240"];
     NSInteger current=[NSUserDefaults.standardUserDefaults integerForKey:@"resolution"];
     for(NSInteger i=0;i<4;i++) [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@%@",current==i?@"✓ ":@"",resolutions[i]] style:UIAlertActionStyleDefault handler:^(UIAlertAction *){[NSUserDefaults.standardUserDefaults setInteger:i forKey:@"resolution"];}]];
+    BOOL powerSave=[NSUserDefaults.standardUserDefaults boolForKey:@"powerSave"];
+    [a addAction:[UIAlertAction actionWithTitle:powerSave?@"关闭省电模式（恢复 60 FPS）":@"开启省电模式（30 FPS）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *){[NSUserDefaults.standardUserDefaults setBool:!powerSave forKey:@"powerSave"];}]];
     [a addAction:[UIAlertAction actionWithTitle:@"导出上次运行日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *){
         NSURL *url=[NSURL fileURLWithPath:[documents() stringByAppendingPathComponent:@"latest-session.log"]];
         if(![[NSFileManager defaultManager] fileExistsAtPath:url.path]) { message(self,@"暂无日志",@"请运行一次游戏并正常退出。"); return; }
@@ -405,6 +446,7 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
 @implementation NavigationController
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return self.topViewController.supportedInterfaceOrientations; }
 - (UIViewController *)childViewControllerForStatusBarHidden { return self.topViewController; }
+- (UIViewController *)childViewControllerForScreenEdgesDeferringSystemGestures { return self.topViewController; }
 @end
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
 @property(nonatomic,strong) UIWindow *window;

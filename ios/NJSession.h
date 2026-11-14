@@ -8,7 +8,9 @@
 - (void)sendEvent:(nj_event)event;
 - (void)stop;
 - (void)setPaused:(BOOL)paused;
+- (void)setAudioAvailable:(BOOL)available;
 - (void)setVolume:(float)volume;
+- (void)setFrameRate:(NSInteger)frameRate;
 - (UIImage *)takeFrame;
 - (NSUInteger)frameCount;
 - (NSString *)logText;

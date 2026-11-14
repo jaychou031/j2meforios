@@ -7,6 +7,8 @@ extern "C" {
 int nj_sf_load_bank(const char *path);
 void *nj_sf_create(void);
 void nj_sf_destroy(void *synth);
+/* After this worker's VM has finished, release players its MIDlet left open. */
+unsigned nj_sf_release_thread_streams(void);
 void nj_sf_note(void *synth, int channel, int key, int velocity, int on);
 void nj_sf_program(void *synth, int channel, int bank, int program);
 void nj_sf_control(void *synth, int channel, int controller, int value);

@@ -15,6 +15,8 @@ int main(int argc,char **argv) {
     opts.device=nj_device_find("nokia6230");opts.stats=1;
     opts.run_frames=(nj_u4)std::strtoul(argv[4],nullptr,10);opts.keys=argv[5];
     int result=nj_run(&port,&opts);nj_port_shutdown(&port);
+    unsigned released=nj_sf_release_thread_streams();
+    std::printf("SOUNDFONT teardown released=%u\n",released);
     auto stats=nj_sf_get_stats();
     std::printf("SOUNDFONT opened=%llu fallback=%llu failures=%llu active=%llu\n",
         (unsigned long long)stats.opened,(unsigned long long)stats.fallback,
