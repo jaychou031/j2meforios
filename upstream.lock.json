@@ -1,0 +1,6 @@
+{
+  "repository": "lucinhu/esp32s31-korvo-nano-j2me",
+  "commit": "cc13cce53cd1e4baa10600baf5a65b3568b44971",
+  "core_repository": "lucinhu/nano_j2me",
+  "core_commit": "c6c618ed3103df94dae8471abec3b1bd9eff7a47"
+}
