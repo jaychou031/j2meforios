@@ -46,3 +46,13 @@ audio_queue_test.cpp compiles the actual AudioOutput against a small fake queue;
 it checks exact PCM order, no idle silent-buffer loop, pause/restart and callbacks
 during synchronous disposal. The fake is not an Apple driver or UIKit emulator.
 SoundFont tests also cover per-worker final cleanup and isolation from other threads.
+
+frame_mailbox_test.cpp verifies exact pixels, bounded reuse, immutable retained
+images, coalesced publication, idle wake and producer/consumer concurrency.
+audio_capture_test.cpp verifies disabled-by-default capture, exact WAV bytes,
+stream reset and the 30-second bound. Capture writes only after the VM stops.
+idle_pacer_test.c tests runnable threads, sleepers, timed waits, parked native
+stacks, empty main frames and display deadlines against the actual core types.
+soundfont-runner with NJ_TEST_IOS_PACER=1 uses the iOS pacing branch with a host
+headless backend; CI runs this as well as the ordinary headless demo path.
+This does not emulate UIKit, iPhone audio conversion or battery use.

@@ -5,6 +5,8 @@
 #include "ToneSample.hpp"
 #include "SoundFontSynth.h"
 #include "SessionLifecycle.hpp"
+#include "FrameMailbox.hpp"
+#include "PcmCapture.hpp"
 #import "GameStorage.h"
 #include "nj_posix_dir.h"
 #include <condition_variable>
@@ -16,28 +18,34 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <sys/resource.h>
 
 struct State {
     std::mutex lock;
-    std::mutex frameLock;
     std::mutex inputLock;
     std::mutex logLock;
     std::condition_variable condition;
     controls::InputQueue input;
-    bool stop=false, paused=false, dirty=false, inputWake=false;
+    bool stop=false, paused=false, inputWake=false;
     bool audioAvailable=true, audioPaused=false, toneWasPlaying=false;
     session::Clock clock;
     int width,height, frameRate=60;
     float volume=0.7f;
     float appliedVolume=-1;
     std::atomic<NSUInteger> frames{0};
-    std::vector<uint32_t> pixels, snapshot;
+    std::vector<uint32_t> pixels;
+    display::FrameMailbox mailbox;
+    CGColorSpaceRef colorSpace=CGColorSpaceCreateDeviceRGB();
+    __strong void (^frameReady)(void)=nil;
+    std::atomic<uint64_t> sleepCalls{0},sleepRequestedMs{0};
     AudioOutput audio;
+    ::audio::PcmCapture capture;
     __strong AVAudioPlayer *tone=nil;
     __strong NSMutableString *logs=[NSMutableString string];
     __strong NSString *rms=nil, *files=nil;
     nj_sf_stats soundfontStart{};
-    explicit State(int w,int h):width(w),height(h),pixels(w*h),snapshot(w*h) {}
+    explicit State(int w,int h):width(w),height(h),pixels(w*h),mailbox(w*h) {}
+    ~State() { CGColorSpaceRelease(colorSpace); }
 };
 static uint64_t hostMillis() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -74,6 +82,7 @@ static void sleepVM(void *ud,nj_u4 ms) {
     yieldVM(ud);
     auto *s=(State *)ud;
     std::unique_lock<std::mutex> guard(s->lock);
+    ++s->sleepCalls; s->sleepRequestedMs+=std::min(ms,50u);
     s->condition.wait_for(guard,std::chrono::milliseconds(std::min(ms,50u)),[s]{return s->stop || s->paused || s->inputWake;});
     // The core may sleep again before the next input poll to pace a frame.
     // Consume each wake once; a nonempty queue must not cause a busy loop.
@@ -94,8 +103,15 @@ static int initDisplay(void *ud,int *w,int *h,int *stride,void **pixels) {
     return NJ_PIXFMT_ARGB8888;
 }
 static void present(void *ud,int,int,int,int) {
-    auto *s=(State *)ud; std::lock_guard<std::mutex> guard(s->frameLock);
-    if(s->pixels!=s->snapshot) { s->snapshot=s->pixels; s->dirty=true; s->frames++; }
+    auto *s=(State *)ud;
+    auto result=s->mailbox.publish(s->pixels.data());
+    if(result.changed) ++s->frames;
+    if(result.wake && s->frameReady) dispatch_async(dispatch_get_main_queue(),s->frameReady);
+}
+static double processCpuMs() {
+    struct rusage usage={}; if(getrusage(RUSAGE_SELF,&usage)!=0) return 0;
+    return (usage.ru_utime.tv_sec+usage.ru_stime.tv_sec)*1000.0+
+           (usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)/1000.0;
 }
 static void logVM(void *ud,int level,const char *msg) {
     @autoreleasepool {
@@ -117,18 +133,23 @@ static int pcmOpen(void *ud,int rate,int channels) {
     float volume;
     { std::lock_guard<std::mutex> guard(s->lock); volume=s->volume; }
     int result=s->audio.open(rate,channels);
-    if(result==0) { s->audio.volume(volume); s->audio.pause(s->audioPaused); }
+    if(result==0) { s->audio.volume(volume); s->audio.pause(s->audioPaused); s->capture.open(rate,channels); }
     return result;
 }
-static int pcmWrite(void *ud,const nj_s2 *p,int n) { return ((State *)ud)->audio.write(p,n); }
+static int pcmWrite(void *ud,const nj_s2 *p,int n) {
+    auto *s=(State *)ud; int took=s->audio.write(p,n);
+    if(took>0) s->capture.append(p,took);
+    return took;
+}
 static int pcmFree(void *ud) { return ((State *)ud)->audio.freeFrames(); }
 static int pcmQueued(void *ud) { return ((State *)ud)->audio.queuedFrames(); }
 static void pcmClose(void *ud) {
     auto *s=(State *)ud; s->audio.close(); auto a=s->audio.stats();
-    char line[256];
-    snprintf(line,sizeof(line),"PCM_CLOSE rate=%d written=%llu played=%llu gaps=%llu gap_silence_frames=%llu last_error=%d",
+    char line[384];
+    snprintf(line,sizeof(line),"PCM_CLOSE rate=%d written=%llu played=%llu gaps=%llu gap_silence_frames=%llu last_error=%d callbacks=%llu short_buffers=%llu starts=%llu block_frames=%d",
         a.rate,(unsigned long long)a.written,(unsigned long long)a.played,
-        (unsigned long long)a.starvationGaps,(unsigned long long)a.gapSilenceFrames,a.lastError);
+        (unsigned long long)a.starvationGaps,(unsigned long long)a.gapSilenceFrames,a.lastError,
+        (unsigned long long)a.callbacks,(unsigned long long)a.shortBuffers,(unsigned long long)a.starts,a.blockFrames);
     logVM(s,2,line);
 }
 static void toneStop(void *ud) { auto *s=(State *)ud; [s->tone stop]; s->tone=nil; s->toneWasPlaying=false; }
@@ -164,6 +185,8 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
 - (void)startJar:(NSString *)path saveID:(NSString *)saveID completion:(void (^)(int))completion {
     NSAssert(!_started,@"A session can only be started once"); _started=YES;
     NSString *docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
+    NSString *capturePath=[docs stringByAppendingPathComponent:@"latest-session-pcm.wav"];
+    [[NSFileManager defaultManager] removeItemAtPath:capturePath error:nil];
     _state->rms=NJGameRMSPath(docs,saveID);
     _state->files=[docs stringByAppendingPathComponent:@"Files"];
     if(!_state->rms) {
@@ -180,6 +203,7 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
         @autoreleasepool {
             State *s=self->_state;
+            double cpuStart=processCpuMs(); uint64_t wallStart=hostMillis();
             { std::lock_guard<std::mutex> guard(s->logLock); s->soundfontStart=nj_sf_get_stats(); }
             NSString *fontPath=[[NSBundle mainBundle] pathForResource:@"GeneralUser-GS-SoftSynth-1.44" ofType:@"sf2"];
             int loaded=fontPath ? nj_sf_load_bank(fontPath.fileSystemRepresentation) : 0;
@@ -201,6 +225,14 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
             unsigned released=nj_sf_release_thread_streams();
             if(released) { char text[96]; snprintf(text,sizeof(text),"SOUNDFONT teardown released %u unclosed streams",released); logVM(s,2,text); }
             s->audio.close(); toneStop(s);
+            if(s->capture.frames()) logVM(s,2,s->capture.save(capturePath.fileSystemRepresentation)?
+                "PCM_CAPTURE saved last stream's first 30 seconds (or its shorter duration), before AudioQueue and app volume":
+                "PCM_CAPTURE failed to save");
+            char perf[192];
+            snprintf(perf,sizeof(perf),"PERF process_cpu_ms=%.1f wall_ms=%llu sleep_calls=%llu sleep_requested_ms=%llu",
+                processCpuMs()-cpuStart,(unsigned long long)(hostMillis()-wallStart),
+                (unsigned long long)s->sleepCalls.load(),(unsigned long long)s->sleepRequestedMs.load());
+            logVM(s,2,perf);
             dispatch_async(dispatch_get_main_queue(),^{ completion(result); });
         }
     });
@@ -227,17 +259,25 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
 }
 - (void)setVolume:(float)volume { std::lock_guard<std::mutex> guard(_state->lock); _state->volume=volume; }
 - (void)setFrameRate:(NSInteger)frameRate { NSAssert(!_started,@"Set frame rate before starting the VM"); _state->frameRate=frameRate==30?30:60; }
+- (void)setFrameReadyHandler:(void (^)(void))handler { NSAssert(!_started,@"Set handler before starting the VM"); _state->frameReady=[handler copy]; }
+- (void)setAudioCapture:(BOOL)enabled { NSAssert(!_started,@"Set capture before starting the VM"); _state->capture.enable(enabled); }
 - (NSUInteger)frameCount { return _state->frames.load(std::memory_order_relaxed); }
 - (NSString *)logText {
     NSString *text;
     nj_sf_stats baseline;
     { std::lock_guard<std::mutex> guard(_state->logLock); text=[_state->logs copy]; baseline=_state->soundfontStart; }
     auto sound=_state->audio.stats();
+    text=[text stringByAppendingFormat:@"\nAUDIO_QUEUE callbacks=%llu short_buffers=%llu starts=%llu block_frames=%d\n",
+        (unsigned long long)sound.callbacks,(unsigned long long)sound.shortBuffers,(unsigned long long)sound.starts,sound.blockFrames];
     text=[text stringByAppendingFormat:@"\nAUDIO rate=%d written=%llu played=%llu empty_frames=%llu saturated_samples=%llu peak_frames=%d last_error=%d gaps=%llu gap_silence_frames=%llu\n",
         sound.rate,(unsigned long long)sound.written,(unsigned long long)sound.played,
         (unsigned long long)sound.underrunFrames,(unsigned long long)sound.clippedSamples,sound.peak,sound.lastError,
         (unsigned long long)sound.starvationGaps,(unsigned long long)sound.gapSilenceFrames];
     auto sf=nj_sf_get_stats();
+    auto frames=_state->mailbox.stats();
+    text=[text stringByAppendingFormat:@"DISPLAY published=%llu consumed=%llu duplicates=%llu busy_drops=%llu copied_bytes=%llu\n",
+        (unsigned long long)frames.published,(unsigned long long)frames.consumed,
+        (unsigned long long)frames.duplicates,(unsigned long long)frames.busyDrops,(unsigned long long)frames.copiedBytes];
     text=[text stringByAppendingFormat:@"AUDIO_MIDI soundfont_streams=%llu waveform_fallbacks=%llu limited_samples=%llu errors=%llu active_streams=%llu\n",
         (unsigned long long)(sf.opened-baseline.opened),(unsigned long long)(sf.fallback-baseline.fallback),
         (unsigned long long)(sf.limited_samples-baseline.limited_samples),
@@ -249,17 +289,18 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
             input.delivered?(double)input.latencyTotal/input.delivered:0.0,
             (unsigned long long)input.latencyMax];
 }
-- (UIImage *)takeFrame {
-    NSData *data;
-    { std::unique_lock<std::mutex> guard(_state->frameLock,std::try_to_lock);
-      // Do not hold up UIKit touch delivery while the VM publishes a frame.
-      if(!guard.owns_lock()) return nil;
-      if(!_state->dirty) return nil; _state->dirty=false;
-      data=[NSData dataWithBytes:_state->snapshot.data() length:_state->snapshot.size()*4]; }
-    CGDataProviderRef provider=CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
-    CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
-    CGImageRef image=CGImageCreate(_width,_height,8,32,_width*4,space,kCGBitmapByteOrder32Little|kCGImageAlphaNoneSkipFirst,provider,nullptr,false,kCGRenderingIntentDefault);
+- (UIImage *)takeFrameWithIdle:(BOOL *)idle {
+    std::shared_ptr<const display::Frame> frame;
+    auto status=_state->mailbox.take(frame);
+    if(idle) *idle=status==display::FrameMailbox::Read::Idle;
+    if(status!=display::FrameMailbox::Read::Frame) return nil;
+    auto *owner=new std::shared_ptr<const display::Frame>(frame);
+    CGDataProviderRef provider=CGDataProviderCreateWithData(owner,frame->data(),frame->size()*4,
+        [](void *info,const void *,size_t){ delete static_cast<std::shared_ptr<const display::Frame> *>(info); });
+    if(!provider) { delete owner; return nil; }
+    CGImageRef image=CGImageCreate(_width,_height,8,32,_width*4,_state->colorSpace,kCGBitmapByteOrder32Little|kCGImageAlphaNoneSkipFirst,provider,nullptr,false,kCGRenderingIntentDefault);
+    if(!image) { CGDataProviderRelease(provider); return nil; }
     UIImage *result=[UIImage imageWithCGImage:image];
-    CGImageRelease(image); CGColorSpaceRelease(space); CGDataProviderRelease(provider); return result;
+    CGImageRelease(image); CGDataProviderRelease(provider); return result;
 }
 @end

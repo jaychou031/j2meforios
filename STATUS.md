@@ -134,3 +134,28 @@ City Bloxx 重新使用干净存档进行 1800 帧回放，build/city-015/contac
 “笃笃”声尚无法确认是乐器或音频路径异常，用户也暂不能判断。已从用户 City Bloxx 与轩辕剑 MIDI 制作完整/去鼓组/仅鼓组的 12 秒本地对比 WAV，保存在 build/audio-diagnostics-016；直接由合成器输出，不经过 iPhone AudioQueue。正式 App 未静音鼓组、未改游戏资源；用户素材不上传。需用户对比或提供录音，并结合新版供数间隙日志继续定位。
 
 本地验证：生命周期门控/暂停时钟测试；实际 AudioOutput 对可重入 Dispose 回调的替身测试（样本顺序、无静音空转、短尾、空闲重启、暂停/恢复）；真实核心 SF2 回归和跨线程资源清理；3D Rally 约 20 秒回放进入赛道、汽车行驶并返回菜单（build/rally-016/contact.png），7 个采样流，退出活动流 0。该回放没有 UIKit，不能证明手机按键已修复。Xcode 编译、真实中断/后台恢复、触摸延迟、听感和耗电仍待本次云端与手机验证。
+
+## 0.1.7（build 8）：实测代码效率优化与音频缺口诊断
+
+用户确认轩辕剑完整参考 WAV 在 iPhone 上无杂音，并提供 0.1.6（7）日志与 31.858 秒 M4A。原件复制保存在 build/audio-diagnostics-017。日志中 gaps=0、last_error=0、saturated_samples=0、合成错误/回退/退出残留流均为 0；不能单凭这些计数排除实际音频链路异常。
+
+用 Windows 自带 Media Foundation 解码录音（没有下载依赖），与游戏 midi/0.mid 完整渲染做频谱及波形对齐：匹配偏移约 4.79 秒，每秒片段波形相关度约 0.97–0.99，未观察到明显累计时间漂移。对齐后的波形有短暂近静音缺口及边缘突变，许多相邻间隔约 70 ms。证据在 analysis.json、alignment.json、difference.png、spike-detail.png；这是录音中的现象，不足以单独区分合成、AudioQueue/系统转换及录制编码环节，尚不宣称根因已确定或杂音已修复。
+
+代码效率改动均默认在 60 FPS 下生效：
+
+- CoreEfficiency.cmake 生成 nj_lib_midlet.c 的外层帧间等待兼容副本。IdlePacer.h 检查真实 Java 线程状态；没有可执行任务时，宿主条件变量等待到最近线程/计时器或帧截止时间。可执行线程用已有 scheduler_frame 分片继续运行。空栈主线程与属于嵌套 C 调用的线程不被误判为可执行工作。没有更改 Thread.yield 的既有 1 ms 兼容补丁、游戏时钟倍率或帧率上限。
+- FrameMailbox.hpp 用三块可复用像素内存发布不可变图像，CGDataProvider 保持引用直至 UIKit 释放，去掉 NSData 的第二次全帧拷贝，并复用颜色空间。UI 无新帧时暂停 CADisplayLink，新帧通过一次主线程通知唤醒；开启 FPS 数字显示时保留刷新。真实样本仍待 UIKit 验收。
+- PcmBuffer.hpp 将逐帧取模/短 memcpy 改为最多两次连续块拷贝，保留样本顺序、背压、在途计数与满幅统计。
+- SoundFontSynth.cpp 不处理没有活动声部的声道；低频检查尾音是否结束，跳过零调制的三角函数、从未开启的混响/合唱计算。已开启的效果尾音仍处理。轩辕剑 9 个 MIDI 前后输出 WAV 的 SHA-256 全部一致，未删除乐器、改变音量或降低采样率。
+
+Windows/MSVC 同一演示、60 FPS 上限、300 帧、三次测量：旧版进程 CPU 中位数 4.859 秒，新版 0.078 秒；两者实际运行时间均约 5.05 秒，帧率接近 60。这个轻负载案例确认帧等待空转被移除，不是整机耗电或复杂游戏性能承诺。PCM 204800000 帧读写微基准约 1059 ms → 171 ms；9 段合成总耗时中位数之和约减少 4%，各曲目收益不同、其中主题曲近乎不变。最终数据见 benchmark.json；benchmark-initial/stale-library 文件是调试阶段资料，不用作结论。
+
+AudioQueue 在 22050 Hz 下将 220 帧块改为 1024 帧块，减少回调、加锁与短块交接；保留 120 ms 软件队列容量，短音效仍按实际长度入队。新增 callbacks/short_buffers/starts/block_frames 统计。该输出调整是需真机对照的候选修复。Apple 文档说明缓冲复用回调并不代表声音已实际播放；原 played/empty/gaps 统计不能被当作硬件输出连续性的证明。
+
+增加可选的一次性 PCM 诊断：设置中开启后，仅下一个游戏在内存保存最后打开的 PCM 流前 30 秒，退出后写 latest-session-pcm.wav；导出日志时附带该文件。音频回调不写盘，正常游戏默认不开启；文件位于游戏内音量处理之后、AudioQueue/App 音量之前。用于把实际流式生成的 PCM 与手机录音对比。
+
+新增 PERF CPU/时长/等待计数与 DISPLAY 发布/消费/重复/拷贝字节计数。旧“省电模式”更名为明确的可选“帧率上限”，保留用户选择，取消系统低电量自动降至 30 FPS；代码效率优化始终生效。
+
+本地通过：控件、输入、PCM、生命周期、实际 AudioOutput 替身、并发帧池、WAV 捕获、真实核心 idle pacer、SoundFont 回归、6 项 Python 检查、Canvas 9 查询、两条调度路径的 yield 时钟/恢复、演示按键与 RMS。iOS 分支下 City Bloxx 回放 1800 帧/30 秒保持 60 FPS，截图确认吊车移动、落块、叠层与 combo 提示；轩辕剑启动至标题菜单。初始缺存档异常由游戏处理，不代表所有存档/关卡兼容。Apple SDK 编译、实际音频输出与真机耗电仍待本次 CI/手机验证。
+
+3D Rally 在 iOS 调度分支下用显式按住/松开脚本回放 1200 帧，进入赛道，截图显示 41/60/45 km/h 与转向；6 个 SF2 流、0 回退/合成错误、退出后活动流 0。证据：build/audio-diagnostics-017/rally-held/contact.png。单帧极短点击脚本在菜单可能被轮询式游戏漏读，不能作为 UIKit 触摸延迟的测量；本次没有额外延长用户按键或改动输入时序。

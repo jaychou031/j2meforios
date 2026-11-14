@@ -11,7 +11,9 @@
 - (void)setAudioAvailable:(BOOL)available;
 - (void)setVolume:(float)volume;
 - (void)setFrameRate:(NSInteger)frameRate;
-- (UIImage *)takeFrame;
+- (void)setFrameReadyHandler:(void (^)(void))handler;
+- (void)setAudioCapture:(BOOL)enabled;
+- (UIImage *)takeFrameWithIdle:(BOOL *)idle;
 - (NSUInteger)frameCount;
 - (NSString *)logText;
 @end

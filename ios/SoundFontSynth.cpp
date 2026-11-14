@@ -20,6 +20,9 @@ std::atomic<uint64_t> opened{0}, fallback{0}, limited{0}, failures{0}, active{0}
 struct Channel {
     tsf *font = nullptr;
     int modulation = 0, reverb = 0, chorus = 0;
+    float tuning = 0;
+    bool rendering = false;
+    unsigned voiceCheck = 16;
 };
 struct Synth {
     tsf *seed = nullptr;
@@ -30,6 +33,7 @@ struct Synth {
     std::array<float, (rate / 50) * 2> chorus{};
     unsigned pa = 0, pb = 0, pc = 0;
     uint64_t position = 0;
+    bool roomEnabled = false, chorusEnabled = false;
     ~Synth() {
         std::lock_guard<std::mutex> guard(bankMutex);
         for (auto &c : channels) tsf_close(c.font);
@@ -90,9 +94,11 @@ extern "C" unsigned nj_sf_release_thread_streams(void) {
     return count;
 }
 extern "C" void nj_sf_note(void *ptr, int ch, int key, int velocity, int on) {
-    auto *f = static_cast<Synth *>(ptr)->channel(ch);
+    auto *s = static_cast<Synth *>(ptr);
+    auto *f = s->channel(ch);
     if (!f) return;
     if (on && velocity) {
+        auto &c=s->channels[(unsigned)ch&15]; c.rendering=true; c.voiceCheck=16;
         if (!tsf_channel_note_on(f, 0, key & 127, (velocity & 127) / 127.0f)) ++failures;
     } else tsf_channel_note_off(f, 0, key & 127);
 }
@@ -107,8 +113,8 @@ extern "C" void nj_sf_control(void *ptr, int ch, int cc, int value) {
     auto &c = s->channels[(unsigned)ch & 15];
     value &= 127;
     if (cc == 1) c.modulation = value;
-    else if (cc == 91) c.reverb = value;
-    else if (cc == 93) c.chorus = value;
+    else if (cc == 91) { c.reverb = value; if(value) s->roomEnabled=true; }
+    else if (cc == 93) { c.chorus = value; if(value) s->chorusEnabled=true; }
     else if (auto *f = s->channel(ch)) tsf_channel_midi_control(f, 0, cc, value);
 }
 extern "C" void nj_sf_pitch(void *ptr, int ch, int wheel, int range) {
@@ -123,33 +129,46 @@ extern "C" void nj_sf_render(void *ptr, unsigned char *out, unsigned frames) {
         unsigned n = frames < block ? frames : block;
         float mix[block * 2]{}, room[block * 2]{}, send[block * 2]{};
         for (auto &c : s->channels) {
-            if (!c.font) continue;
+            if (!c.font || !c.rendering) continue;
             // External CC1 vibrato; SF2's own instrument LFO remains in TSF.
-            float vibrato = 0.35f * c.modulation / 127.0f *
-                (float)std::sin(s->position * (6.283185307179586 * 5.0 / rate));
-            tsf_channel_set_tuning(c.font, 0, vibrato);
+            float vibrato = c.modulation ? 0.35f * c.modulation / 127.0f *
+                (float)std::sin(s->position * (6.283185307179586 * 5.0 / rate)) : 0.0f;
+            if (vibrato != c.tuning) {
+                tsf_channel_set_tuning(c.font, 0, vibrato); c.tuning=vibrato;
+            }
             float buffer[block * 2];
             tsf_render_float(c.font, buffer, (int)n, 0);
+            // Check release tails only occasionally; scanning the voice table
+            // before every render would double the hot-path traversal.
+            if(--c.voiceCheck==0) { c.rendering=tsf_active_voice_count(c.font)!=0; c.voiceCheck=16; }
             for (unsigned i = 0; i < n * 2; ++i) {
                 mix[i] += buffer[i];
-                room[i] += buffer[i] * (c.reverb / 127.0f);
-                send[i] += buffer[i] * (c.chorus / 127.0f);
+                if(c.reverb) room[i] += buffer[i] * (c.reverb / 127.0f);
+                if(c.chorus) send[i] += buffer[i] * (c.chorus / 127.0f);
             }
         }
         // Per-channel sends into bounded shared stereo effects. This preserves
         // CC91/93 behavior without relying on TSF's unsupported SF2 generators.
         for (unsigned i = 0; i < n; ++i) {
-            unsigned delay = rate / 125 + (unsigned)((1.0 +
-                std::sin((s->position + i) * (6.283185307179586 * 0.7 / rate))) * (rate / 250));
-            unsigned rp = (s->pc + rate / 50 - delay) % (rate / 50);
+            unsigned rp = 0;
+            if(s->chorusEnabled) {
+                unsigned delay = rate / 125 + (unsigned)((1.0 +
+                    std::sin((s->position + i) * (6.283185307179586 * 0.7 / rate))) * (rate / 250));
+                rp = (s->pc + rate / 50 - delay) % (rate / 50);
+            }
             for (unsigned lr = 0; lr < 2; ++lr) {
                 unsigned j = i * 2 + lr;
-                float a = s->roomA[s->pa * 2 + lr], b = s->roomB[s->pb * 2 + lr];
-                s->roomA[s->pa * 2 + lr] = room[j] + a * 0.46f;
-                s->roomB[s->pb * 2 + lr] = room[j] + b * 0.37f;
-                float wet = s->chorus[rp * 2 + lr];
-                s->chorus[s->pc * 2 + lr] = send[j];
-                float value = mix[j] + (a + b) * 0.18f + wet * 0.16f;
+                float value = mix[j];
+                if(s->roomEnabled) {
+                    float a = s->roomA[s->pa * 2 + lr], b = s->roomB[s->pb * 2 + lr];
+                    s->roomA[s->pa * 2 + lr] = room[j] + a * 0.46f;
+                    s->roomB[s->pb * 2 + lr] = room[j] + b * 0.37f;
+                    value += (a + b) * 0.18f;
+                }
+                if(s->chorusEnabled) {
+                    float wet = s->chorus[rp * 2 + lr];
+                    s->chorus[s->pc * 2 + lr] = send[j]; value += wet * 0.16f;
+                }
                 float magnitude = std::fabs(value);
                 if (!std::isfinite(value)) { value = 0; ++failures; }
                 else if (magnitude > 0.9f) {
@@ -162,9 +181,8 @@ extern "C" void nj_sf_render(void *ptr, unsigned char *out, unsigned frames) {
                 out[j * 2] = (unsigned char)(sample & 255);
                 out[j * 2 + 1] = (unsigned char)((sample >> 8) & 255);
             }
-            s->pa = (s->pa + 1) % (rate / 10);
-            s->pb = (s->pb + 1) % (rate / 14);
-            s->pc = (s->pc + 1) % (rate / 50);
+            if(s->roomEnabled) { s->pa = (s->pa + 1) % (rate / 10); s->pb = (s->pb + 1) % (rate / 14); }
+            if(s->chorusEnabled) s->pc = (s->pc + 1) % (rate / 50);
         }
         s->position += n; frames -= n; out += n * 4;
     }

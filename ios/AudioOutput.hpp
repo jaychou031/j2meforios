@@ -12,6 +12,7 @@ class AudioOutput {
     bool running=false, paused=false, enqueued[3]={};
     int lastError=0;
     uint64_t starvationGaps=0, gapSilenceFrames=0, emptySince=0;
+    uint64_t callbacks=0,shortBuffers=0,starts=0;
     int fill(AudioQueueBufferRef buffer,bool countUnderrun);
     void updateRunning();
     static void callback(void *context,AudioQueueRef queue,AudioQueueBufferRef buffer);
@@ -24,6 +25,6 @@ public:
     void close();
     void pause(bool paused);
     void volume(float value);
-    struct Stats { uint64_t written,played,underrunFrames,clippedSamples; int rate,peak,lastError; uint64_t starvationGaps,gapSilenceFrames; };
+    struct Stats { uint64_t written,played,underrunFrames,clippedSamples; int rate,peak,lastError; uint64_t starvationGaps,gapSilenceFrames,callbacks,shortBuffers,starts; int blockFrames; };
     Stats stats();
 };

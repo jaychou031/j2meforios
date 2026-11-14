@@ -12,12 +12,14 @@ int AudioOutput::fill(AudioQueueBufferRef b,bool countUnderrun) {
     int n=pcm.read(static_cast<int16_t *>(b->mAudioData),blockFrames,countUnderrun);
     b->mAudioDataByteSize=static_cast<UInt32>(n*channels*sizeof(int16_t));
     b->mUserData=reinterpret_cast<void *>(static_cast<uintptr_t>(n));
+    if(n>0 && n<blockFrames) ++shortBuffers;
     return n;
 }
 void AudioOutput::callback(void *context,AudioQueueRef q,AudioQueueBufferRef b) {
     auto *s=static_cast<AudioOutput *>(context);
     std::lock_guard<std::mutex> guard(s->lock);
     if(q!=s->queue) return; // Dispose/reset returns retired buffers too.
+    ++s->callbacks;
     int index=0;
     while(index<3 && s->buffers[index]!=b) ++index;
     if(index==3) return;
@@ -50,7 +52,7 @@ void AudioOutput::updateRunning() {
         std::lock_guard<std::mutex> guard(lock);
         if(queue==q) {
             if(status!=noErr) lastError=status;
-            else if(start) running=true;
+            else if(start) { running=true; ++starts; }
         }
     }
 }
@@ -59,9 +61,15 @@ int AudioOutput::open(int rate,int count) {
     if(rate<4000 || rate>192000 || count<1 || count>2) return -1;
     {
         std::lock_guard<std::mutex> guard(lock);
-        channels=count; sampleRate=rate; blockFrames=std::max(1,rate/100);
+        channels=count; sampleRate=rate;
+        // Larger power-of-two blocks reduce callback/locking overhead and
+        // avoid a steady stream of 220-frame (9.98 ms) buffers at 22050 Hz.
+        // Total queued capacity stays 120 ms; short effects still start now.
+        blockFrames=256;
+        while(blockFrames<rate/25 && blockFrames<2048) blockFrames*=2;
         pcm.reset(rate,count); lastError=0;
         starvationGaps=gapSilenceFrames=emptySince=0;
+        callbacks=shortBuffers=starts=0;
     }
     AudioStreamBasicDescription format={};
     format.mSampleRate=rate; format.mFormatID=kAudioFormatLinearPCM;
@@ -125,5 +133,5 @@ void AudioOutput::pause(bool value) {
 void AudioOutput::volume(float value) { if(queue) AudioQueueSetParameter(queue,kAudioQueueParam_Volume,std::clamp(value,0.0f,1.0f)); }
 AudioOutput::Stats AudioOutput::stats() {
     std::lock_guard<std::mutex> guard(lock);
-    return {pcm.written,pcm.played,pcm.underrunFrames,pcm.clippedSamples,sampleRate,pcm.peak,lastError,starvationGaps,gapSilenceFrames};
+    return {pcm.written,pcm.played,pcm.underrunFrames,pcm.clippedSamples,sampleRate,pcm.peak,lastError,starvationGaps,gapSilenceFrames,callbacks,shortBuffers,starts,blockFrames};
 }

@@ -1,0 +1,27 @@
+# Patch the outer frame wait, not Thread.sleep/yield or game timing.
+function(j2me_apply_core_efficiency target core)
+  file(READ "${core}/src/midp/nj_lib_midlet.c" source)
+  macro(pace_replace before after)
+    string(FIND "${source}" "${before}" at)
+    if(at EQUAL -1)
+      message(FATAL_ERROR "Pinned frame-pacer anchor changed: ${before}")
+    endif()
+    string(REPLACE "${before}" "${after}" source "${source}")
+  endmacro()
+  pace_replace("static void frame_pace_wait(nj_vm *vm, nj_s8 wait)"
+               "#include \"IdlePacer.h\"\n\nstatic void frame_pace_wait(nj_vm *vm, nj_s8 wait)")
+  pace_replace("        if (nj_scheduler_has_threads(vm)) {"
+               "        if (vm->port->name && strcmp(vm->port->name, \"ios\") == 0 && vm->port->sleep_ms) {\n            nj_s8 idle_ms = ios_pacer_idle_ms(vm, nj_now_ms(vm), left);\n            if (idle_ms > 0) {\n                vm->port->sleep_ms(vm->port->ud, (nj_u4)idle_ms);\n            } else {\n                nj_status st = nj_scheduler_frame(vm, (nj_u4)(left > 4 ? 4 : 1));\n                if (st != NJ_OK && st != NJ_ERR_TIMEOUT) break;\n            }\n        } else if (nj_scheduler_has_threads(vm)) {")
+  set(generated "${CMAKE_CURRENT_BINARY_DIR}/compat/nj_lib_midlet.c")
+  file(WRITE "${generated}.in" "${source}")
+  configure_file("${generated}.in" "${generated}" COPYONLY)
+  get_target_property(sources ${target} SOURCES)
+  list(FIND sources "src/midp/nj_lib_midlet.c" index)
+  if(index EQUAL -1)
+    message(FATAL_ERROR "Pinned MIDlet source list changed")
+  endif()
+  list(REMOVE_ITEM sources "src/midp/nj_lib_midlet.c")
+  set_property(TARGET ${target} PROPERTY SOURCES "${sources}")
+  target_sources(${target} PRIVATE "${generated}")
+endfunction()
+

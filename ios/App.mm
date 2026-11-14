@@ -187,8 +187,13 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     const int widths[]={240,176,128,320}, heights[]={320,208,160,240};
     resolution=std::clamp(resolution,0,3);
     _session=[[NJSession alloc] initWithWidth:widths[resolution] height:heights[resolution]];
-    BOOL powerSave=[defaults boolForKey:@"powerSave"] || NSProcessInfo.processInfo.lowPowerModeEnabled;
-    [_session setFrameRate:powerSave?30:60];
+    BOOL captureAudio=[defaults boolForKey:@"capturePCM"];
+    [_session setAudioCapture:captureAudio];
+    if(captureAudio) [defaults setBool:NO forKey:@"capturePCM"]; // one session
+    // Efficiency fixes apply at full speed. A legacy optional frame cap stays
+    // user-controlled; entering iOS Low Power Mode does not silently cap games.
+    BOOL limitFPS=[defaults boolForKey:@"powerSave"];
+    [_session setFrameRate:limitFPS?30:60];
     _volume=[defaults floatForKey:@"volume"]; [_session setVolume:_volume];
     _surface=[GameSurface new]; _surface.session=_session; _surface.pixel=[defaults boolForKey:@"pixel"];
     [self.view addSubview:_surface];
@@ -205,11 +210,17 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     [_session setAudioAvailable:_lifecycle.audioAvailable];
     [_session setPaused:_lifecycle.pauseVM()];
     _timer=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
-    _timer.preferredFramesPerSecond=powerSave?30:60;
+    _timer.preferredFramesPerSecond=limitFPS?30:60;
     [_timer addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    _timer.paused=_lifecycle.pauseVM();
+    _timer.paused=YES; // first changed frame wakes the display link
     UIApplication.sharedApplication.idleTimerDisabled=YES;
     __weak GameController *weakSelf=self;
+    [_session setFrameReadyHandler:^{
+        GameController *owner=weakSelf;
+        if(owner && !owner->_lifecycle.pauseVM() && !owner->_stopping) {
+            owner->_lastTickHost=0; owner->_timer.paused=NO;
+        }
+    }];
     [_session startJar:_jarPath saveID:_saveID completion:^(int status){ [weakSelf finished:status]; }];
 }
 - (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.navigationController setNavigationBarHidden:YES animated:animated]; }
@@ -234,7 +245,9 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     NSTimeInterval host=NSProcessInfo.processInfo.systemUptime;
     if(_lastTickHost>0) _maxMainGap=MAX(_maxMainGap,host-_lastTickHost);
     _lastTickHost=host;
-    UIImage *frame=[_session takeFrame]; if(frame) _surface.gameImage=frame;
+    BOOL idle=NO;
+    UIImage *frame=[_session takeFrameWithIdle:&idle]; if(frame) _surface.gameImage=frame;
+    if(idle && !_showFPS) { _timer.paused=YES; _lastTickHost=0; }
     if(timer.timestamp-_lastTime>=0.5) {
         NSUInteger count=_session.frameCount;
         double fps=_lastTime?(count-_lastFrames)/(timer.timestamp-_lastTime):0;
@@ -243,7 +256,7 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     }
 }
 - (void)scale { _surface.pixel=!_surface.pixel; [NSUserDefaults.standardUserDefaults setBool:_surface.pixel forKey:@"pixel"]; }
-- (void)toggleFPS { _showFPS=!_showFPS; if(!_showFPS) [_fps setTitle:@"FPS 关" forState:UIControlStateNormal]; [NSUserDefaults.standardUserDefaults setBool:_showFPS forKey:@"fps"]; }
+- (void)toggleFPS { _showFPS=!_showFPS; if(!_showFPS) [_fps setTitle:@"FPS 关" forState:UIControlStateNormal]; else if(!_lifecycle.pauseVM()) _timer.paused=NO; [NSUserDefaults.standardUserDefaults setBool:_showFPS forKey:@"fps"]; }
 - (void)volumeBy:(float)delta { _volume=std::clamp(_volume+delta,0.0f,1.0f); [_session setVolume:_volume]; [NSUserDefaults.standardUserDefaults setFloat:_volume forKey:@"volume"]; }
 - (void)quieter { [self volumeBy:-0.1f]; }
 - (void)louder { [self volumeBy:0.1f]; }
@@ -424,16 +437,23 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     [self reload]; if(errors.count) message(self,@"部分文件未导入",[errors componentsJoinedByString:@"\n"]);
 }
 - (void)settings {
-    UIAlertController *a=[UIAlertController alertControllerWithTitle:@"设置" message:@"分辨率和省电模式在下次启动游戏时生效。省电模式限制为 30 FPS；系统低电量模式也会启用此限制。横竖屏只改变界面布局。" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *a=[UIAlertController alertControllerWithTitle:@"设置" message:@"分辨率和帧率上限在下次启动游戏时生效。默认 60 FPS，代码效率优化始终启用。横竖屏只改变界面布局。" preferredStyle:UIAlertControllerStyleAlert];
     NSArray *resolutions=@[@"240 × 320",@"176 × 208",@"128 × 160",@"320 × 240"];
     NSInteger current=[NSUserDefaults.standardUserDefaults integerForKey:@"resolution"];
     for(NSInteger i=0;i<4;i++) [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@%@",current==i?@"✓ ":@"",resolutions[i]] style:UIAlertActionStyleDefault handler:^(UIAlertAction *){[NSUserDefaults.standardUserDefaults setInteger:i forKey:@"resolution"];}]];
     BOOL powerSave=[NSUserDefaults.standardUserDefaults boolForKey:@"powerSave"];
-    [a addAction:[UIAlertAction actionWithTitle:powerSave?@"关闭省电模式（恢复 60 FPS）":@"开启省电模式（30 FPS）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *){[NSUserDefaults.standardUserDefaults setBool:!powerSave forKey:@"powerSave"];}]];
+    [a addAction:[UIAlertAction actionWithTitle:powerSave?@"帧率上限：30 → 60 FPS":@"帧率上限：60 → 30 FPS" style:UIAlertActionStyleDefault handler:^(UIAlertAction *){[NSUserDefaults.standardUserDefaults setBool:!powerSave forKey:@"powerSave"];}]];
+    BOOL capture=[NSUserDefaults.standardUserDefaults boolForKey:@"capturePCM"];
+    [a addAction:[UIAlertAction actionWithTitle:capture?@"取消下次音频诊断录制":@"下次游戏录制音频诊断（最多 30 秒）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *){
+        [NSUserDefaults.standardUserDefaults setBool:!capture forKey:@"capturePCM"];
+    }]];
     [a addAction:[UIAlertAction actionWithTitle:@"导出上次运行日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *){
         NSURL *url=[NSURL fileURLWithPath:[documents() stringByAppendingPathComponent:@"latest-session.log"]];
         if(![[NSFileManager defaultManager] fileExistsAtPath:url.path]) { message(self,@"暂无日志",@"请运行一次游戏并正常退出。"); return; }
-        UIActivityViewController *share=[[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+        NSMutableArray *items=[NSMutableArray arrayWithObject:url];
+        NSURL *pcm=[NSURL fileURLWithPath:[documents() stringByAppendingPathComponent:@"latest-session-pcm.wav"]];
+        if([[NSFileManager defaultManager] fileExistsAtPath:pcm.path]) [items addObject:pcm];
+        UIActivityViewController *share=[[UIActivityViewController alloc] initWithActivityItems:items applicationActivities:nil];
         [self presentViewController:share animated:YES completion:nil];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];

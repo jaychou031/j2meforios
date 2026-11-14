@@ -9,6 +9,7 @@ int main(int argc,char **argv) {
     nj_port port{};
     if(nj_port_headless_ex(&port,240,320,120,argc==7?argv[6]:nullptr)!=NJ_OK) return 3;
     port.fps_cap=60;
+    if(std::getenv("NJ_TEST_IOS_PACER")) port.name="ios";
     port.rms_dir=argv[3];
     nj_run_opts opts{};
     opts.jar_path=argv[2];opts.heap_bytes=32u*1024u*1024u;

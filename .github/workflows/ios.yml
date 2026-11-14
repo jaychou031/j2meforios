@@ -36,9 +36,13 @@ jobs:
           build/pcm-buffer-test
           clang++ -std=c++17 -Wall -Wextra -Werror tests/lifecycle_test.cpp -o build/lifecycle-test
           build/lifecycle-test
+          clang++ -std=c++17 -Wall -Wextra -Werror tests/frame_mailbox_test.cpp -o build/frame-mailbox-test
+          build/frame-mailbox-test
           clang++ -std=c++17 -Wall -Wextra -Werror -x c++ -Itests/audio_queue_fake ios/AudioOutput.mm tests/audio_queue_test.cpp -o build/audio-queue-test
           build/audio-queue-test
           mkdir -p build/tmp
+          clang++ -std=c++17 -Wall -Wextra -Werror tests/audio_capture_test.cpp -o build/audio-capture-test
+          build/audio-capture-test build/tmp
           clang++ -std=c++17 -fobjc-arc -framework Foundation tests/storage_test.mm ios/GameStorage.mm -o build/storage-test
           build/storage-test build/tmp
           python3 -m unittest discover -s tests -p 'test_*.py'
@@ -51,7 +55,8 @@ jobs:
       - name: Run actual core demo and persistence smoke test
         run: |
           cmake -S tests/core -B build/core-host
-          cmake --build build/core-host --target nj2me-cli port-stats-test soundfont-test soundfont-runner --parallel 3
+          cmake --build build/core-host --target nj2me-cli port-stats-test soundfont-test soundfont-runner idle-pacer-test --parallel 3
+          build/core-host/idle-pacer-test
           build/core-host/soundfont-test ios/SoundFont/GeneralUser-GS-SoftSynth-1.44.sf2
           mkdir -p build/tmp/port-stats
           (cd build/tmp/port-stats && ../../core-host/port-stats-test ../../../upstream/esp32s31-korvo-nano-j2me/assets/korvo_demo.jar)
@@ -60,6 +65,7 @@ jobs:
           python3 scripts/smoke-core.py build/core-host/core/nj2me
           mkdir -p build/tmp/soundfont-demo
           build/core-host/soundfont-runner ios/SoundFont/GeneralUser-GS-SoftSynth-1.44.sf2 upstream/esp32s31-korvo-nano-j2me/assets/korvo_demo.jar build/tmp/soundfont-demo 60 '10:53' > build/soundfont-demo.log 2>&1
+          NJ_TEST_IOS_PACER=1 build/core-host/soundfont-runner ios/SoundFont/GeneralUser-GS-SoftSynth-1.44.sf2 upstream/esp32s31-korvo-nano-j2me/assets/korvo_demo.jar build/tmp/soundfont-demo 120 '10:53' > build/ios-pacer-demo.log 2>&1
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
@@ -77,4 +83,5 @@ jobs:
             build/canvas-compat.log
             build/yield-compat.log
             build/soundfont-demo.log
+            build/ios-pacer-demo.log
           if-no-files-found: warn
