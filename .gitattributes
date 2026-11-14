@@ -1,0 +1,6 @@
+# These upstream resources are pinned by their original byte-level SHA-256.
+# Preserve their bytes in the index and every checkout, including CRLF text.
+/third_party/TinySoundFont/tsf.h -text
+/third_party/TinySoundFont/LICENSE -text
+/ios/SoundFont/GeneralUser-GS-SoftSynth-1.44.sf2 -text
+/ios/SoundFont/GeneralUser-LICENSE.txt -text

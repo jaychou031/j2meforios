@@ -110,3 +110,11 @@ iOS 在 VM 工作线程加载 App 内置 SF2，后续会话复用样本缓存；
 City Bloxx 重新使用干净存档进行 1800 帧回放，build/city-015/contact.png 确认城市教程、吊车、落块、Tower height 3 / Population 7 结算；运行中打开 9 个采样流，0 回退、0 合成错误，退出后活动流为 0。该 headless 测试不模拟手机音频背压，不能把其 PCM 帧计数当作真实播放时长。初始化旧有缺存档异常仍由游戏处理，不据此声称所有存档/关卡兼容。
 
 0.1.5 的 Apple/Xcode 构建、AudioQueue 真机听感、快速换键、横竖屏和后台恢复仍待用户用脚本上传并安装验证；本地没有生成或验收 IPA。
+
+## 0.1.5 构建修复：保留音源依赖原始换行
+
+用户的 Actions 停在 verify-audio.py，提示 third_party/TinySoundFont/tsf.h 哈希不符，尚未进入 iOS 编译。本地检查实际上传目录 build/publish-20261114-190609：Git core.autocrlf=true；tsf.h 原始文件含 2079 个 CRLF，提交对象变成 LF，SHA-256 从 70d55963... 变为 997092e4...；GeneralUser-LICENSE.txt 也被同样转换。SF2 本身和 TinySoundFont LICENSE 未损坏。不是依赖版本不一致，也不需要重新下载。
+
+新增 .gitattributes，只为四个已锁定依赖设置 -text，保留原始字节；未修改全局 Git 配置、依赖内容或预期哈希。publish.ps1 纳入该文件，先校验本地 SHA-256，再按新属性重新暂存依赖，并比较每个暂存对象与原始文件的 Git 对象哈希；不一致就停止提交。源码包同步包含 .gitattributes。
+
+新增 tests/test_git_audio.py，在项目 build/tmp 内创建隔离 Git 仓库，core.autocrlf=true 时先复现原错误，再应用属性并重新暂存，最后以 core.autocrlf=false 导出文件。四个暂存对象及导出文件均匹配原始 SHA-256。本地全部 6 项 Python 测试、PowerShell 语法及原始资源哈希检查通过。此次只修复提交/检验流程，App 版本仍为 0.1.5（build 6）；修复后的 Apple 云端构建仍待用户重新提交验证。

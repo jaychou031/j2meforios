@@ -36,3 +36,7 @@ soundfont_runner.cpp runs an actual MIDlet with the loaded bank and checks that
 all stream instances close. User game files are not committed or packaged.
 verify-audio.py checks pinned dependencies; verify-app-audio.py checks the
 actual device bundle before packaging. None of these checks replace device audio.
+
+test_git_audio.py reproduces core.autocrlf=true altering the original header,
+then verifies all pinned files survive re-staging and an LF-default checkout
+with the project .gitattributes. All test repositories stay under build/tmp.
