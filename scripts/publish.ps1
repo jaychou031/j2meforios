@@ -28,10 +28,10 @@ try {
         if ([string]::IsNullOrWhiteSpace($email)) { throw 'Commit author email cannot be empty.' }
         Invoke-Git -C $checkout config --local user.email $email
     }
-    foreach ($item in @('.github', '.gitignore', 'CMakeLists.txt', 'upstream.lock.json', 'README.md', 'FEASIBILITY.md', 'STATUS.md', 'ios', 'scripts', 'tests', 'cmake')) {
+    foreach ($item in @('.github', '.gitignore', 'CMakeLists.txt', 'upstream.lock.json', 'audio-dependencies.lock.json', 'README.md', 'FEASIBILITY.md', 'STATUS.md', 'ios', 'scripts', 'tests', 'cmake', 'third_party')) {
         Copy-Item -LiteralPath (Join-Path $projectRoot $item) -Destination $checkout -Recurse -Force
     }
-    Invoke-Git -C $checkout add .github .gitignore CMakeLists.txt upstream.lock.json README.md FEASIBILITY.md STATUS.md ios scripts tests cmake
+    Invoke-Git -C $checkout add .github .gitignore CMakeLists.txt upstream.lock.json audio-dependencies.lock.json README.md FEASIBILITY.md STATUS.md ios scripts tests cmake third_party
     & git -C $checkout diff --cached --quiet
     if ($LASTEXITCODE -eq 0) { Write-Host 'The repository already contains these files.'; return }
     if ($LASTEXITCODE -ne 1) { throw 'Unable to inspect staged changes.' }

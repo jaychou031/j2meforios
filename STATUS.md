@@ -74,3 +74,39 @@ City Bloxx 1.0.8 的 p 类继承 Nokia FullCanvas，通过接口 m 调用 getGam
 图标：采用用户下载的 HelloClyde/BBK9588-J2ME assets/icons/j2me-coffee.png（512x512 透明图），合成为白底，生成 iPhone AppIcon 资源及 1024x1024 图，接入 Xcode 资源编译；绿色背景 source 图未采用。
 
 本地通过：MSVC C++ 控件与输入队列测试；9 项 Canvas 接口/虚方法/静态方法键码查询实际 VM 测试；原核心演示两次启动和 RMS 回读；3 项 Python 图标/打包测试。Foundation 文件操作测试已加入 macOS CI，当前 Windows 不能运行。新 UIKit、图标打包和 0.1.2 真机效果仍待用户上传后验证。
+
+## 0.1.3（build 4）：City Bloxx 计时与音频输出
+
+用户反馈上一轮已上机：按键略有改善但未完全解决；City Bloxx 菜单已能操作，Build city 后仍卡住；声音有失真。Git 连接恢复，后续继续用 scripts/publish.ps1 的 Git 命令提交，不使用网页自动化。
+
+本地先用原 0.1.2 核心复现 Build city 城市网格不动、FIRE/5 无法通过教程、右软键可返回。只在 build/host 生成调试核心，按帧读取游戏字段：House.cg 在数秒内停在约 164～212 ms，教程要求 cg-bX >= 600 ms；按键标志已正确进入游戏。游戏的 8 次循环平均毫秒增量因 Thread.yield 空操作导致高速循环而归零。原核心执行量约 99 M 字节码/秒，此指标是解释器工作量，不是设备 CPU 占用率。
+
+cmake/CoreCompatibility.cmake 为 nj_lib_thread.c 生成第二个兼容副本，将 Thread.yield 改为 nj_thread_sleep(vm, th, 1)，只让当前 Java 线程协作暂停一个时钟单位，不睡眠整个宿主、不改游戏时钟。保留 Canvas 菜单补丁，上游源文件不改。先带字段探针验证 cg 每秒正常推进，再关闭探针，用干净存档重新回放：build/city-013-clean 的 1800 帧/30 秒截图确认教程出现、5/FIRE 可翻页、吊车运动、落块形成三层楼、人口 4 和结算，日志包含保存/继续路径。没有据此声称全部关卡或 iPhone 已验证。
+
+音频：改为首批真实 PCM 到达后启动 AudioQueue，取消原先三段 1024 帧启动静音；缓冲按约 10 ms 分块，总待播容量约 120 ms（含设备中的帧），短尾按实际长度提交。首次启动前应用用户音量，简单提示音加 5 ms 淡入淡出。新增 AUDIO 最近一条 PCM 流统计及 MIDI 后端标记；empty_frames 包含自然结束时的空回调，不能单凭该数值认定丢音。核心 MIDI 仍为简化波形音源，不保证原手机音色，尚不能判定用户听到的失真是否全部解决。
+
+本地已通过：控件/输入队列测试、五种采样率单/双声道 PCM 顺序与在途计数测试、提示音包络测试、实际 AudioOutput C++ 代码对本地 AudioQueue 替身的生命周期/短尾/首批启动测试、9 项 Canvas 实际 VM 查询、96 次实际 VM yield 时钟与恢复测试、演示按键/RMS、3 项 Python 图标/打包测试。AudioQueue 替身不模拟 Apple 音频驱动。新版本的 Xcode/UIKit/实际 AudioQueue 编译运行、真机快速换键、听感和后台恢复仍待用户上传及手机验证。
+
+## 0.1.4（build 5）：真机日志检查与音频后续工作
+
+用户提供 latest-session.log，并说明 City Bloxx 停在城市地图、右软键仍可返回；音频连续但有破音、杂音，乐器音色差异较大。原日志只读归档到 build/logs/user-audio-session-20261114.log。日志末尾 APP_VERSION=0.1.2 BUILD=3，因此不包含 0.1.3 的 yield/PCM 修复。
+
+本次日志：INPUT max=16 ms、UI_TOUCH max=24.51 ms、UI_MAIN max_tick_gap=17.33 ms，未显示明显主线程长停顿；这是该次短会话的统计，不能否定其他游戏的快速换键问题。City Bloxx 约 146.69 M 字节码/秒，与已复现的 yield 空转现象一致。城市保存出现数组越界和空指针；不自动清空用户存档，也不据此认定硬件损坏或持久化后端故障。
+
+修复：nj_run.c 因链接了 headless 符号，就用 headless 状态布局解释 iOS 的 port.ud，导致 observed 音频/文件数字无意义及不安全读取。cmake/CoreCompatibility.cmake 生成第三个兼容副本，只对明确 name=headless 的端口调用这些观察器。真实 VM stats 保留，iOS 音频继续使用 AudioOutput 自己的统计。port_stats_test.c 使用相同后端的 headless/custom 两个身份运行演示，验证通用统计保留、专有观察器仅适用于正确端口；本地 MSVC 实际核心测试通过，并加入 macOS CI。
+
+音频分析：从用户 JAR 中提取的 20 个 MIDI 仅保存于 build/audio-analysis，分别用原波形合成器渲染至结束或约 60 秒。本地结果未观察到满幅 PCM 样本或所检查的两处混响反馈乘法溢出；不能据此排除 iPhone 输出路径问题或所有形式的听感失真。结果在 render-results.json。当前合成器使用简化波形，缺少采样音色库；调节输出缓冲无法还原真实乐器。拟先测试 TinySoundFont 与 GeneralUser GS SoftSynth 1.44；下载说明在 downloads/midi-audio/README.md。依赖尚未下载/接入，本版不宣称音源升级完成。0.1.4 的 Apple 编译及真机结果待验证。
+
+## 0.1.5（build 6）：离线采样音源
+
+用户已提供 TinySoundFont-main.zip 与 GeneralUser_GS_1.44-SoftSynth.zip。已读取并原样保留原始许可证，SF2 仅规范化文件名；源码/音色库/许可证及压缩包 SHA-256 写入 audio-dependencies.lock.json。只使用 TinySoundFont v0.9 合成器，未引入 TinyMidiLoader，继续使用固定核心的 MIDI 解析、事件队列和时间换算。
+
+cmake/SoundFont.cmake 为 nj_midi.c 生成兼容副本，增加不透明采样流状态和合成分支；旧波形分支保留为加载失败回退。修复原 no-note 初始化失败路径对解析数组的重复释放。外层 SoundFontSynth.cpp 为各 MIDI 通道维护独立声部、共享只读样本，串行保护 TSF 的非原子共享计数。音符/鼓组、实时音量、表情、声像、弯音与范围、延音踏板、调制、CC91/93 发送保留；后两项由外部简易效果器实现，并非某款手机效果器的精确仿真。输出仍为核心约定的 22050 Hz，使用立体声、-9 dB 合成余量和软限幅；尾长沿用原核心，最终 5 ms 淡出防止截断跳变。
+
+iOS 在 VM 工作线程加载 App 内置 SF2，后续会话复用样本缓存；播放流/通道共享样本，但控制器和效果状态独立。增加 SOUNDFONT 加载记录及每会话采样流数、回退数、软限幅样本、合成错误和活动流计数。CMake 将 SF2 和两个来源许可证打包；构建脚本在生成 IPA 前逐个校验 App 内的资源哈希，避免缺音色库却显示构建成功。发布脚本和源码打包脚本已包含 third_party 与音源哈希清单。
+
+本地 Windows 实际核心测试通过：无音色库回退、立体声、定位/重启一致、速度/节奏、实时音量、乐器/鼓组区别、声像、弯音、延音踏板、longMidiEvent 原有轨道字节输入、效果输出、并存流隔离、无音符文件清理和流释放。20 个用户 MIDI 渲染均有非零输出、0 个满幅样本、0 个软限幅样本、0 个合成错误，最大幅值 27759/32768；完整结果在 build/audio-analysis/soundfont-results.json。仅本地生成对比音频，不上传用户游戏或提取内容。
+
+City Bloxx 重新使用干净存档进行 1800 帧回放，build/city-015/contact.png 确认城市教程、吊车、落块、Tower height 3 / Population 7 结算；运行中打开 9 个采样流，0 回退、0 合成错误，退出后活动流为 0。该 headless 测试不模拟手机音频背压，不能把其 PCM 帧计数当作真实播放时长。初始化旧有缺存档异常仍由游戏处理，不据此声称所有存档/关卡兼容。
+
+0.1.5 的 Apple/Xcode 构建、AudioQueue 真机听感、快速换键、横竖屏和后台恢复仍待用户用脚本上传并安装验证；本地没有生成或验收 IPA。

@@ -1,0 +1,20 @@
+{
+  "sources": {
+    "TinySoundFont": "https://github.com/schellingb/TinySoundFont",
+    "GeneralUser GS SoftSynth 1.44": "https://www.schristiancollins.com/generaluser.php"
+  },
+  "files": {
+    "third_party/TinySoundFont/LICENSE": "ef10cb839de73fb6d5d32ea7151979e87809a6df70dc7e7ee8457ae1c9e7aa7e",
+    "third_party/TinySoundFont/tsf.h": "70d55963c98f60ebb81518eaa1f25d46888d5180eb5f5289fd6b74ffc177d197",
+    "ios/SoundFont/GeneralUser-GS-SoftSynth-1.44.sf2": "00725296486f652ba42bdbf2098254762ca80239353d04b55a27454fc8edb8a8",
+    "ios/SoundFont/GeneralUser-LICENSE.txt": "067b1a91a227e77c51ec9ed710b2b60f52476ed9e63242468d4df20ff8a98598"
+  },
+  "versions": {
+    "TinySoundFont": "v0.9 (header version; exact bytes pinned below)",
+    "GeneralUser GS SoftSynth": "1.44"
+  },
+  "download_archives": {
+    "GeneralUser_GS_1.44-SoftSynth.zip": "68cb601ffbbe7fb67d2454135bd62b194ac43b932246fe1e408cda2c5525710d",
+    "TinySoundFont-main.zip": "e544337c4f6a75b41b524a82f2afcbe10e1f1c38d8cecacb68007b6f0cfbc450"
+  }
+}

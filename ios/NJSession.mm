@@ -2,6 +2,8 @@
 #import <AVFoundation/AVFoundation.h>
 #include "AudioOutput.hpp"
 #include "InputQueue.hpp"
+#include "ToneSample.hpp"
+#include "SoundFontSynth.h"
 #import "GameStorage.h"
 #include "nj_posix_dir.h"
 #include <condition_variable>
@@ -31,6 +33,7 @@ struct State {
     __strong AVAudioPlayer *tone=nil;
     __strong NSMutableString *logs=[NSMutableString string];
     __strong NSString *rms=nil, *files=nil;
+    nj_sf_stats soundfontStart{};
     explicit State(int w,int h):width(w),height(h),pixels(w*h),snapshot(w*h) {}
 };
 static nj_u4 millis(void *) {
@@ -94,7 +97,12 @@ static int now(void *,nj_datetime *out) {
     out->weekday=local.tm_wday; out->tz_offset=(int)(local.tm_gmtoff/60); return 1;
 }
 static int pcmOpen(void *ud,int rate,int channels) {
-    auto *s=(State *)ud; s->appliedVolume=-1; return s->audio.open(rate,channels);
+    auto *s=(State *)ud; s->appliedVolume=-1;
+    float volume;
+    { std::lock_guard<std::mutex> guard(s->lock); volume=s->volume; }
+    int result=s->audio.open(rate,channels);
+    if(result==0) s->audio.volume(volume); // apply before the first audible buffer
+    return result;
 }
 static int pcmWrite(void *ud,const nj_s2 *p,int n) { return ((State *)ud)->audio.write(p,n); }
 static int pcmFree(void *ud) { return ((State *)ud)->audio.freeFrames(); }
@@ -115,7 +123,7 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
     memcpy(b+36,"data",4); u32(40,(uint32_t)n*2);
     int16_t *samples=(int16_t *)(b+44); size_t pos=0;
     for(int i=0;i<count;i++) for(uint32_t j=0;j<(uint32_t)tones[i].duration_ms*22050/1000;j++)
-        samples[pos++]=(int16_t)(sin(6.283185307179586*tones[i].freq_hz*j/22050)*6000);
+        samples[pos++]=audio::toneSample(tones[i].freq_hz,j,(uint32_t)tones[i].duration_ms*22050/1000,22050);
     NSError *error=nil; s->tone=[[AVAudioPlayer alloc] initWithData:wav error:&error];
     float volume;
     { std::lock_guard<std::mutex> guard(s->lock); volume=s->volume; }
@@ -148,6 +156,11 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
         @autoreleasepool {
             State *s=self->_state;
+            { std::lock_guard<std::mutex> guard(s->logLock); s->soundfontStart=nj_sf_get_stats(); }
+            NSString *fontPath=[[NSBundle mainBundle] pathForResource:@"GeneralUser-GS-SoftSynth-1.44" ofType:@"sf2"];
+            int loaded=fontPath ? nj_sf_load_bank(fontPath.fileSystemRepresentation) : 0;
+            logVM(s,loaded?2:0,loaded ? "SOUNDFONT loaded: GeneralUser GS SoftSynth 1.44 / TinySoundFont" :
+                  "SOUNDFONT load failed: using core waveform fallback");
             nj_port port={}; port.name="ios"; port.ud=s; port.user=s;
             port.millis=millis; port.now=now; port.idle=yieldVM; port.sleep_ms=sleepVM;
             port.log=logVM; port.display_init=initDisplay; port.display_present=present;
@@ -182,7 +195,17 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
 - (NSUInteger)frameCount { return _state->frames.load(std::memory_order_relaxed); }
 - (NSString *)logText {
     NSString *text;
-    { std::lock_guard<std::mutex> guard(_state->logLock); text=[_state->logs copy]; }
+    nj_sf_stats baseline;
+    { std::lock_guard<std::mutex> guard(_state->logLock); text=[_state->logs copy]; baseline=_state->soundfontStart; }
+    auto sound=_state->audio.stats();
+    text=[text stringByAppendingFormat:@"\nAUDIO rate=%d written=%llu played=%llu empty_frames=%llu saturated_samples=%llu peak_frames=%d last_error=%d\n",
+        sound.rate,(unsigned long long)sound.written,(unsigned long long)sound.played,
+        (unsigned long long)sound.underrunFrames,(unsigned long long)sound.clippedSamples,sound.peak,sound.lastError];
+    auto sf=nj_sf_get_stats();
+    text=[text stringByAppendingFormat:@"AUDIO_MIDI soundfont_streams=%llu waveform_fallbacks=%llu limited_samples=%llu errors=%llu active_streams=%llu\n",
+        (unsigned long long)(sf.opened-baseline.opened),(unsigned long long)(sf.fallback-baseline.fallback),
+        (unsigned long long)(sf.limited_samples-baseline.limited_samples),
+        (unsigned long long)(sf.errors-baseline.errors),(unsigned long long)sf.active];
     std::lock_guard<std::mutex> guard(_state->inputLock);
     const auto& input=_state->input;
     return [text stringByAppendingFormat:@"\nINPUT delivered=%llu peak=%zu average_ms=%.2f max_ms=%llu\n",

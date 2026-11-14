@@ -27,10 +27,13 @@ jobs:
       - name: Test portable input and layout
         run: |
           mkdir -p build
+          python3 scripts/verify-audio.py
           clang++ -std=c++17 -Wall -Wextra -Werror tests/controls_test.cpp -o build/controls-test
           build/controls-test
           clang++ -std=c++17 -Wall -Wextra -Werror -DNJ_USE_LIBC=1 -Iupstream/esp32s31-korvo-nano-j2me/third_party/nano_j2me/include tests/input_queue_test.cpp -o build/input-queue-test
           build/input-queue-test
+          clang++ -std=c++17 -Wall -Wextra -Werror tests/pcm_buffer_test.cpp -o build/pcm-buffer-test
+          build/pcm-buffer-test
           mkdir -p build/tmp
           clang++ -std=c++17 -fobjc-arc -framework Foundation tests/storage_test.mm ios/GameStorage.mm -o build/storage-test
           build/storage-test build/tmp
@@ -44,9 +47,15 @@ jobs:
       - name: Run actual core demo and persistence smoke test
         run: |
           cmake -S tests/core -B build/core-host
-          cmake --build build/core-host --target nj2me-cli --parallel 3
+          cmake --build build/core-host --target nj2me-cli port-stats-test soundfont-test soundfont-runner --parallel 3
+          build/core-host/soundfont-test ios/SoundFont/GeneralUser-GS-SoftSynth-1.44.sf2
+          mkdir -p build/tmp/port-stats
+          (cd build/tmp/port-stats && ../../core-host/port-stats-test ../../../upstream/esp32s31-korvo-nano-j2me/assets/korvo_demo.jar)
           python3 scripts/smoke-canvas.py build/core-host/core/nj2me
+          python3 scripts/smoke-yield.py build/core-host/core/nj2me
           python3 scripts/smoke-core.py build/core-host/core/nj2me
+          mkdir -p build/tmp/soundfont-demo
+          build/core-host/soundfont-runner ios/SoundFont/GeneralUser-GS-SoftSynth-1.44.sf2 upstream/esp32s31-korvo-nano-j2me/assets/korvo_demo.jar build/tmp/soundfont-demo 60 '10:53' > build/soundfont-demo.log 2>&1
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
@@ -62,4 +71,6 @@ jobs:
             build-ios.log
             build/demo-boot-*.log
             build/canvas-compat.log
+            build/yield-compat.log
+            build/soundfont-demo.log
           if-no-files-found: warn
