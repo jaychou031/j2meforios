@@ -29,7 +29,7 @@ set_source_files_properties("${DEMO}" "${CORE_LICENSE}" PROPERTIES MACOSX_PACKAG
 add_executable(J2MEForIOS MACOSX_BUNDLE ios/App.mm ios/NJSession.mm ios/AudioOutput.mm "${DEMO}" "${CORE_LICENSE}")
 target_include_directories(J2MEForIOS PRIVATE ios "${CORE}/src/port/posix")
 target_compile_options(J2MEForIOS PRIVATE -fobjc-arc -Wall -Wextra)
-target_link_libraries(J2MEForIOS PRIVATE nj2me "-framework UIKit" "-framework Foundation" "-framework QuartzCore" "-framework AVFoundation" "-framework AudioToolbox" "-framework UniformTypeIdentifiers")
+target_link_libraries(J2MEForIOS PRIVATE nj2me "-framework UIKit" "-framework Foundation" "-framework CoreGraphics" "-framework QuartzCore" "-framework AVFoundation" "-framework AudioToolbox" "-framework UniformTypeIdentifiers")
 set_target_properties(J2MEForIOS PROPERTIES
   MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist"
   XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "org.nanoj2me.ios"
