@@ -31,23 +31,33 @@ jobs:
           build/controls-test
           python3 -m unittest discover -s tests -p 'test_*.py'
       - name: Build device application and package IPA
-        run: bash scripts/build-ios.sh 2>&1 | tee build-ios.log
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/build-ios.sh 2>&1 | tee build-ios.log
+          test -s dist/J2MEForIOS-unsigned.ipa
       - name: Run actual core demo and persistence smoke test
         run: |
           cmake -S upstream/esp32s31-korvo-nano-j2me/third_party/nano_j2me -B build/core-host \
-            -DCMAKE_C_FLAGS=-D_DARWIN_C_SOURCE=1 \
+            "-DCMAKE_C_FLAGS=-D_DARWIN_C_SOURCE=1 -DNJ_USE_LIBC=1" \
             -DNJ_BUILD_TESTS=OFF -DNJ_BUILD_SDL2=OFF -DNJ_BUILD_CLI=ON \
             -DNJ_BUILD_LIBRETRO=OFF -DNJ_BUILD_EMBEDDED_PORTS=OFF \
             -DNJ_BUILD_POSIX_NETWORK=OFF -DNJ_ENABLE_MEDIA=1 \
             -DNJ_PIXFMT=NJ_PIXFMT_ARGB8888
           cmake --build build/core-host --target nj2me-cli --parallel 3
           python3 scripts/smoke-core.py build/core-host/nj2me
-      - uses: actions/upload-artifact@v4
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: J2MEForIOS-unsigned-IPA
+          path: dist/J2MEForIOS-unsigned.ipa
+          if-no-files-found: error
+      - name: Upload diagnostic logs
+        uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: J2MEForIOS-build
+          name: J2MEForIOS-build-logs
           path: |
-            dist/*.ipa
             build-ios.log
             build/demo-boot-*.log
           if-no-files-found: warn
