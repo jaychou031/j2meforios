@@ -1,6 +1,8 @@
 #import "NJSession.h"
 #import <AVFoundation/AVFoundation.h>
 #include "AudioOutput.hpp"
+#include "InputQueue.hpp"
+#import "GameStorage.h"
 #include "nj_posix_dir.h"
 #include <condition_variable>
 #include <deque>
@@ -10,16 +12,20 @@
 #include <cmath>
 #include <thread>
 #include <chrono>
+#include <atomic>
 
 struct State {
     std::mutex lock;
+    std::mutex frameLock;
+    std::mutex inputLock;
+    std::mutex logLock;
     std::condition_variable condition;
-    std::deque<nj_event> events;
-    bool stop=false, paused=false, dirty=false;
+    controls::InputQueue input;
+    bool stop=false, paused=false, dirty=false, inputWake=false;
     int width,height;
     float volume=0.7f;
     float appliedVolume=-1;
-    NSUInteger frames=0;
+    std::atomic<NSUInteger> frames{0};
     std::vector<uint32_t> pixels, snapshot;
     AudioOutput audio;
     __strong AVAudioPlayer *tone=nil;
@@ -49,29 +55,34 @@ static void sleepVM(void *ud,nj_u4 ms) {
     yieldVM(ud);
     auto *s=(State *)ud;
     std::unique_lock<std::mutex> guard(s->lock);
-    s->condition.wait_for(guard,std::chrono::milliseconds(std::min(ms,50u)),[s]{return s->stop || s->paused;});
+    s->condition.wait_for(guard,std::chrono::milliseconds(std::min(ms,50u)),[s]{return s->stop || s->paused || s->inputWake;});
+    // The core may sleep again before the next input poll to pace a frame.
+    // Consume each wake once; a nonempty queue must not cause a busy loop.
+    s->inputWake=false;
 }
 static int poll(void *ud,nj_event *event) {
     yieldVM(ud);
     auto *s=(State *)ud;
-    std::lock_guard<std::mutex> guard(s->lock);
-    if(s->stop) { s->stop=false; *event={}; event->type=NJ_EV_QUIT; return 1; }
-    if(s->events.empty()) return 0;
-    *event=s->events.front(); s->events.pop_front(); return 1;
+    {
+        std::lock_guard<std::mutex> guard(s->lock);
+        if(s->stop) { s->stop=false; *event={}; event->type=NJ_EV_QUIT; return 1; }
+    }
+    std::lock_guard<std::mutex> guard(s->inputLock);
+    return s->input.pop(*event,millis(nullptr))?1:0;
 }
 static int initDisplay(void *ud,int *w,int *h,int *stride,void **pixels) {
     auto *s=(State *)ud; *w=s->width; *h=s->height; *stride=*w*4; *pixels=s->pixels.data();
     return NJ_PIXFMT_ARGB8888;
 }
 static void present(void *ud,int,int,int,int) {
-    auto *s=(State *)ud; std::lock_guard<std::mutex> guard(s->lock);
+    auto *s=(State *)ud; std::lock_guard<std::mutex> guard(s->frameLock);
     if(s->pixels!=s->snapshot) { s->snapshot=s->pixels; s->dirty=true; s->frames++; }
 }
 static void logVM(void *ud,int level,const char *msg) {
     @autoreleasepool {
         auto *s=(State *)ud;
         NSString *text=msg?[NSString stringWithUTF8String:msg]:@"";
-        std::lock_guard<std::mutex> guard(s->lock);
+        std::lock_guard<std::mutex> guard(s->logLock);
         [s->logs appendFormat:@"[%d] %@\n",level,text?:@"(invalid UTF-8)"];
         if(s->logs.length>65536) [s->logs deleteCharactersInRange:NSMakeRange(0,s->logs.length-49152)];
     }
@@ -106,7 +117,9 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
     for(int i=0;i<count;i++) for(uint32_t j=0;j<(uint32_t)tones[i].duration_ms*22050/1000;j++)
         samples[pos++]=(int16_t)(sin(6.283185307179586*tones[i].freq_hz*j/22050)*6000);
     NSError *error=nil; s->tone=[[AVAudioPlayer alloc] initWithData:wav error:&error];
-    { std::lock_guard<std::mutex> guard(s->lock); s->tone.volume=s->volume; }
+    float volume;
+    { std::lock_guard<std::mutex> guard(s->lock); volume=s->volume; }
+    s->tone.volume=volume;
     return s->tone && [s->tone play]?0:-1;
 }
 
@@ -119,8 +132,12 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
 - (void)startJar:(NSString *)path saveID:(NSString *)saveID completion:(void (^)(int))completion {
     NSAssert(!_started,@"A session can only be started once"); _started=YES;
     NSString *docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
-    _state->rms=[docs stringByAppendingPathComponent:[@"Saves" stringByAppendingPathComponent:saveID]];
+    _state->rms=NJGameRMSPath(docs,saveID);
     _state->files=[docs stringByAppendingPathComponent:@"Files"];
+    if(!_state->rms) {
+        logVM(_state,0,"Invalid game storage ID");
+        dispatch_async(dispatch_get_main_queue(),^{ completion(-1); }); return;
+    }
     NSError *error=nil;
     for(NSString *dir in @[_state->rms,_state->files]) {
         if(![[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&error]) {
@@ -148,15 +165,36 @@ static int tonePlay(void *ud,const nj_audio_tone *tones,int count) {
         }
     });
 }
-- (void)sendEvent:(nj_event)event { std::lock_guard<std::mutex> guard(_state->lock); _state->events.push_back(event); }
+- (void)sendEvent:(nj_event)event {
+    {
+        std::lock_guard<std::mutex> guard(_state->inputLock);
+        _state->input.push(event,millis(nullptr));
+    }
+    {
+        std::lock_guard<std::mutex> guard(_state->lock);
+        _state->inputWake=true;
+    }
+    _state->condition.notify_one();
+}
 - (void)stop { std::lock_guard<std::mutex> guard(_state->lock); _state->stop=true; _state->paused=false; _state->condition.notify_all(); }
 - (void)setPaused:(BOOL)paused { std::lock_guard<std::mutex> guard(_state->lock); _state->paused=paused; _state->condition.notify_all(); }
 - (void)setVolume:(float)volume { std::lock_guard<std::mutex> guard(_state->lock); _state->volume=volume; }
-- (NSUInteger)frameCount { std::lock_guard<std::mutex> guard(_state->lock); return _state->frames; }
-- (NSString *)logText { std::lock_guard<std::mutex> guard(_state->lock); return [_state->logs copy]; }
+- (NSUInteger)frameCount { return _state->frames.load(std::memory_order_relaxed); }
+- (NSString *)logText {
+    NSString *text;
+    { std::lock_guard<std::mutex> guard(_state->logLock); text=[_state->logs copy]; }
+    std::lock_guard<std::mutex> guard(_state->inputLock);
+    const auto& input=_state->input;
+    return [text stringByAppendingFormat:@"\nINPUT delivered=%llu peak=%zu average_ms=%.2f max_ms=%llu\n",
+            (unsigned long long)input.delivered,input.peak,
+            input.delivered?(double)input.latencyTotal/input.delivered:0.0,
+            (unsigned long long)input.latencyMax];
+}
 - (UIImage *)takeFrame {
     NSData *data;
-    { std::lock_guard<std::mutex> guard(_state->lock);
+    { std::unique_lock<std::mutex> guard(_state->frameLock,std::try_to_lock);
+      // Do not hold up UIKit touch delivery while the VM publishes a frame.
+      if(!guard.owns_lock()) return nil;
       if(!_state->dirty) return nil; _state->dirty=false;
       data=[NSData dataWithBytes:_state->snapshot.data() length:_state->snapshot.size()*4]; }
     CGDataProviderRef provider=CGDataProviderCreateWithCFData((__bridge CFDataRef)data);

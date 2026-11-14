@@ -29,12 +29,31 @@ inline Rect cell(Rect pad,int col,int row) {
     double w=pad.w/3,h=pad.h/5;
     return {pad.x+col*w+2,pad.y+row*h+2,w-4,h-4};
 }
+// The visual gutter is not a dead zone. Keep a small amount of hysteresis
+// around the current cell so finger jitter does not release a held key.
+inline Rect hitCell(Rect pad,int col,int row) {
+    double w=pad.w/3,h=pad.h/5;
+    return {pad.x+col*w,pad.y+row*h,w,h};
+}
+struct HitKey { int code; Rect rect; };
+inline int hitTest(const std::vector<HitKey>& keys,double x,double y,int current) {
+    for(const auto& key:keys) if(key.code==current) {
+        const double slop=6;
+        Rect expanded={key.rect.x-slop,key.rect.y-slop,key.rect.w+2*slop,key.rect.h+2*slop};
+        if(expanded.contains(x,y)) return current;
+    }
+    for(const auto& key:keys) if(key.rect.contains(x,y)) return key.code;
+    return 0;
+}
 // A key stays down until the last finger holding it leaves. One ordered
 // transition stream preserves short taps between two VM polls.
 class HeldKeys {
     std::map<uintptr_t,int> fingers;
     std::map<int,int> counts;
 public:
+    int keyForFinger(uintptr_t finger) const {
+        auto it=fingers.find(finger); return it==fingers.end()?0:it->second;
+    }
     template<class Emit> void move(uintptr_t finger,int key,Emit emit) {
         auto it=fingers.find(finger);
         int old=it==fingers.end()?0:it->second;

@@ -1,8 +1,10 @@
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AVFoundation/AVFoundation.h>
+#import <QuartzCore/QuartzCore.h>
 #import <CommonCrypto/CommonDigest.h>
 #import "NJSession.h"
+#import "GameStorage.h"
 #include "Controls.hpp"
 
 static NSString *documents() { return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject; }
@@ -19,18 +21,43 @@ static void message(UIViewController *owner,NSString *title,NSString *text) {
 @property(nonatomic,strong) UIImage *gameImage;
 @property(nonatomic) BOOL pixel;
 - (void)releaseTouches;
+- (NSString *)inputDiagnostics;
 @end
 struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect rect; };
 @implementation GameSurface {
+    UIImageView *_display;
     std::vector<KeyCap> _keys;
+    std::vector<controls::HitKey> _hitKeys;
     controls::HeldKeys _held;
     __weak UITouch *_pointer;
     CGPoint _lastPointer;
     controls::Rect _screen;
+    CGRect _layoutBounds;
+    BOOL _hasLayout, _layoutPixel;
+    int _layoutWidth, _layoutHeight;
+    CGFloat _layoutScale;
+    NSUInteger _touchSamples;
+    double _touchDelayTotal, _touchDelayMax;
 }
-- (instancetype)init { if((self=[super init])) { self.multipleTouchEnabled=YES; self.backgroundColor=UIColor.blackColor; } return self; }
+@synthesize gameImage=_gameImage;
+- (instancetype)init {
+    if((self=[super init])) {
+        self.multipleTouchEnabled=YES; self.backgroundColor=UIColor.blackColor;
+        _display=[UIImageView new]; _display.userInteractionEnabled=NO;
+        _display.contentMode=UIViewContentModeScaleToFill;
+        [self addSubview:_display];
+    }
+    return self;
+}
 - (void)key:(int)key down:(BOOL)down {
     nj_event e={}; e.type=down?NJ_EV_KEY_DOWN:NJ_EV_KEY_UP; e.key=key; [_session sendEvent:e];
+    for(const auto& cap:_keys) if(cap.code==key) [self setNeedsDisplayInRect:cg(cap.rect)];
+}
+- (void)setGameImage:(UIImage *)image {
+    _gameImage=image;
+    // UIKit composites the game image independently from the keypad backing
+    // store, so a new game frame never schedules a keypad drawRect pass.
+    _display.image=image;
 }
 - (void)pointer:(int)type point:(CGPoint)p {
     if(_screen.w<=0 || _screen.h<=0) return;
@@ -42,27 +69,43 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
 - (void)releaseTouches {
     _held.clear([&](int k,bool d){[self key:k down:d];});
     if(_pointer) [self pointer:NJ_EV_POINTER_UP point:_lastPointer];
-    _pointer=nil; [self setNeedsDisplay];
+    _pointer=nil;
 }
 - (void)layoutSubviews {
-    [super layoutSubviews]; [self releaseTouches]; _keys.clear();
+    [super layoutSubviews];
+    int width=_session.width?:240, height=_session.height?:320;
+    CGFloat scale=self.window.screen.scale?:3;
+    // Toolbar/FPS updates can trigger layout without changing the controls.
+    // Only an actual geometry change should cancel held fingers.
+    if(_hasLayout && CGRectEqualToRect(_layoutBounds,self.bounds) &&
+       _layoutWidth==width && _layoutHeight==height &&
+       _layoutPixel==_pixel && _layoutScale==scale) return;
+    [self releaseTouches]; _keys.clear(); _hitKeys.clear();
+    _hasLayout=YES; _layoutBounds=self.bounds; _layoutWidth=width; _layoutHeight=height;
+    _layoutPixel=_pixel; _layoutScale=scale;
     auto layout=controls::layout(self.bounds.size.width,self.bounds.size.height);
-    _screen=controls::fit(layout.viewport,_session.width?:240,_session.height?:320,_pixel,self.window.screen.scale?:3);
+    _screen=controls::fit(layout.viewport,width,height,_pixel,scale);
+    _display.frame=cg(_screen);
+    _display.layer.magnificationFilter=_pixel?kCAFilterNearest:kCAFilterLinear;
+    _display.layer.minificationFilter=_pixel?kCAFilterNearest:kCAFilterLinear;
     const int left[15]={0,NJ_KEY_UP,0,NJ_KEY_LEFT,NJ_KEY_FIRE,NJ_KEY_RIGHT,0,NJ_KEY_DOWN,0,NJ_KEY_GAME_A,NJ_KEY_GAME_B,NJ_KEY_GAME_C,NJ_KEY_GAME_D,NJ_KEY_SOFT_LEFT,NJ_KEY_CLEAR};
     NSArray *labels=@[@"",@"▲",@"",@"◀",@"FIRE",@"▶",@"",@"▼",@"",@"A",@"B",@"C",@"D",@"左软键",@"CLEAR"];
-    for(int i=0;i<15;i++) if(left[i]) _keys.push_back({left[i],labels[i],controls::cell(layout.left,i%3,i/3)});
+    for(int i=0;i<15;i++) if(left[i]) {
+        _keys.push_back({left[i],labels[i],controls::cell(layout.left,i%3,i/3)});
+        _hitKeys.push_back({left[i],controls::hitCell(layout.left,i%3,i/3)});
+    }
     const int right[15]={NJ_KEY_1,NJ_KEY_2,NJ_KEY_3,NJ_KEY_4,NJ_KEY_5,NJ_KEY_6,NJ_KEY_7,NJ_KEY_8,NJ_KEY_9,NJ_KEY_STAR,NJ_KEY_0,NJ_KEY_POUND,0,NJ_KEY_SOFT_RIGHT,0};
     NSArray *digits=@[@"1",@"2",@"3",@"4",@"5",@"6",@"7",@"8",@"9",@"*",@"0",@"#",@"",@"右软键",@""];
-    for(int i=0;i<15;i++) if(right[i]) _keys.push_back({right[i],digits[i],controls::cell(layout.right,i%3,i/3)});
+    for(int i=0;i<15;i++) if(right[i]) {
+        _keys.push_back({right[i],digits[i],controls::cell(layout.right,i%3,i/3)});
+        _hitKeys.push_back({right[i],controls::hitCell(layout.right,i%3,i/3)});
+    }
     [self setNeedsDisplay];
 }
 - (void)setPixel:(BOOL)pixel { _pixel=pixel; [self setNeedsLayout]; }
 - (void)drawRect:(CGRect)rect {
-    (void)rect;
-    CGContextRef context=UIGraphicsGetCurrentContext();
-    CGContextSetInterpolationQuality(context,_pixel?kCGInterpolationNone:kCGInterpolationLow);
-    [_gameImage drawInRect:cg(_screen)];
     for(auto key:_keys) {
+        if(!CGRectIntersectsRect(rect,cg(key.rect))) continue;
         UIColor *fill=_held.down(key.code)?accent():[UIColor colorWithWhite:0.13 alpha:1];
         [fill setFill]; [[UIBezierPath bezierPathWithRoundedRect:cg(key.rect) cornerRadius:9] fill];
         NSDictionary *attributes=@{NSFontAttributeName:[UIFont systemFontOfSize:14 weight:UIFontWeightSemibold],NSForegroundColorAttributeName:_held.down(key.code)?UIColor.blackColor:UIColor.whiteColor};
@@ -72,9 +115,9 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
 }
 - (void)updateTouches:(NSSet<UITouch *> *)touches ending:(BOOL)ending {
     for(UITouch *touch in touches) {
-        CGPoint p=[touch locationInView:self]; int code=0;
-        if(!ending) for(auto cap:_keys) if(cap.rect.contains(p.x,p.y)) { code=cap.code; break; }
+        CGPoint p=[touch locationInView:self];
         uintptr_t token=(uintptr_t)(__bridge void *)touch;
+        int code=ending?0:controls::hitTest(_hitKeys,p.x,p.y,_held.keyForFinger(token));
         _held.move(token,code,[&](int k,bool d){[self key:k down:d];});
         if(_pointer==touch) {
             if(ending || code || !_screen.contains(p.x,p.y)) { [self pointer:NJ_EV_POINTER_UP point:p]; _pointer=nil; }
@@ -83,9 +126,20 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
             _pointer=touch; [self pointer:NJ_EV_POINTER_DOWN point:p];
         }
     }
-    [self setNeedsDisplay];
 }
-- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { (void)e; [self updateTouches:t ending:NO]; }
+- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    (void)e;
+    NSTimeInterval now=NSProcessInfo.processInfo.systemUptime;
+    for(UITouch *touch in t) {
+        double delay=MAX(0.0,(now-touch.timestamp)*1000.0);
+        ++_touchSamples; _touchDelayTotal+=delay; _touchDelayMax=MAX(_touchDelayMax,delay);
+    }
+    [self updateTouches:t ending:NO];
+}
+- (NSString *)inputDiagnostics {
+    return [NSString stringWithFormat:@"UI_TOUCH samples=%lu average_delivery_ms=%.2f max_delivery_ms=%.2f\n",
+        (unsigned long)_touchSamples,_touchSamples?_touchDelayTotal/_touchSamples:0.0,_touchDelayMax];
+}
 - (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { (void)e; [self updateTouches:t ending:NO]; }
 - (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { (void)e; [self updateTouches:t ending:YES]; }
 - (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { (void)e; [self updateTouches:t ending:YES]; }
@@ -102,6 +156,7 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     UIButton *_fps;
     CADisplayLink *_timer;
     NSTimeInterval _lastTime;
+    NSTimeInterval _lastTickHost, _maxMainGap;
     NSUInteger _lastFrames;
     BOOL _showFPS, _locked, _stopping, _audioInterrupted;
     UIInterfaceOrientationMask _lockMask;
@@ -146,7 +201,10 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     _surface.frame=CGRectMake(safe.origin.x,safe.origin.y+44,safe.size.width,MAX(1,safe.size.height-44));
 }
 - (void)tick:(CADisplayLink *)timer {
-    UIImage *frame=[_session takeFrame]; if(frame) { _surface.gameImage=frame; [_surface setNeedsDisplay]; }
+    NSTimeInterval host=NSProcessInfo.processInfo.systemUptime;
+    if(_lastTickHost>0) _maxMainGap=MAX(_maxMainGap,host-_lastTickHost);
+    _lastTickHost=host;
+    UIImage *frame=[_session takeFrame]; if(frame) _surface.gameImage=frame;
     if(timer.timestamp-_lastTime>=0.5) {
         NSUInteger count=_session.frameCount;
         double fps=_lastTime?(count-_lastFrames)/(timer.timestamp-_lastTime):0;
@@ -159,10 +217,11 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
 - (void)volumeBy:(float)delta { _volume=std::clamp(_volume+delta,0.0f,1.0f); [_session setVolume:_volume]; [NSUserDefaults.standardUserDefaults setFloat:_volume forKey:@"volume"]; }
 - (void)quieter { [self volumeBy:-0.1f]; }
 - (void)louder { [self volumeBy:0.1f]; }
-- (void)inactive { [_surface releaseTouches]; [_session setPaused:YES]; }
+- (void)inactive { _lastTickHost=0; [_surface releaseTouches]; [_session setPaused:YES]; }
 - (void)notificationInactive:(NSNotification *)notification { (void)notification; [self inactive]; }
 - (void)notificationActive:(NSNotification *)notification { (void)notification; [self active]; }
 - (void)active {
+    _lastTickHost=0;
     if(!_audioInterrupted && !self.presentedViewController && !_stopping) {
         [AVAudioSession.sharedInstance setActive:YES error:nil]; [_session setPaused:NO];
     }
@@ -193,7 +252,11 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     UIApplication.sharedApplication.idleTimerDisabled=NO;
     [AVAudioSession.sharedInstance setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
     NSString *path=[documents() stringByAppendingPathComponent:@"latest-session.log"];
-    [_session.logText writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *log=[_session.logText stringByAppendingFormat:@"%@UI_MAIN max_tick_gap_ms=%.2f\nAPP_VERSION=%@ BUILD=%@\n",
+        [_surface inputDiagnostics],_maxMainGap*1000.0,
+        [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
+        [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]];
+    [log writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if(self.presentedViewController) [self dismissViewControllerAnimated:NO completion:nil];
     UIViewController *library=self.navigationController.viewControllers.firstObject;
     [self.navigationController popViewControllerAnimated:NO];
@@ -235,8 +298,56 @@ struct KeyCap { int code; __unsafe_unretained NSString *label; controls::Rect re
     UITableViewCell *cell=[table dequeueReusableCellWithIdentifier:@"game"];
     if(!cell) cell=[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"game"];
     cell.textLabel.text=_games[path.row][@"title"]; cell.textLabel.numberOfLines=2;
-    cell.detailTextLabel.text=path.row==0?@"验证画面、按键、音调和 RMS":@"点击启动 · 从菜单正常退出以保存";
-    cell.accessoryType=UITableViewCellAccessoryDisclosureIndicator; return cell;
+    BOOL builtin=[_games[path.row][@"id"] isEqualToString:@"builtin-demo"];
+    cell.detailTextLabel.text=builtin?@"验证画面、按键、音调和 RMS · ⓘ 管理数据":@"点击启动 · 左滑或点 ⓘ 管理";
+    cell.accessoryType=UITableViewCellAccessoryDetailButton; return cell;
+}
+- (void)confirmManageGame:(NSDictionary *)game deleting:(BOOL)deleting {
+    BOOL builtin=[game[@"id"] isEqualToString:@"builtin-demo"];
+    if(deleting && builtin) return;
+    NSString *title=deleting?@"删除游戏":@"清空游戏数据";
+    NSString *detail=deleting?@"删除该游戏的 JAR 和独立存档（RMS）。此操作不可撤销。":@"清空该游戏的独立存档（RMS），包括通常保存在其中的进度和设置；游戏文件会保留。此操作不可撤销。";
+    detail=[detail stringByAppendingString:@"\n共用 Files 目录中的导出文件会保留，不会删除其他游戏的数据。"];
+    UIAlertController *alert=[UIAlertController alertControllerWithTitle:title message:[NSString stringWithFormat:@"%@\n\n%@",game[@"title"],detail] preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDestructive handler:^(UIAlertAction *){
+        NSError *error=nil;
+        BOOL ok=deleting?NJDeleteImportedGame(documents(),[game[@"path"] lastPathComponent],&error):NJClearGameData(documents(),game[@"id"],&error);
+        [self reload];
+        if(!ok) [self dismissViewControllerAnimated:YES completion:^{
+            message(self,@"未能完成",[NSString stringWithFormat:@"%@\n部分文件可能已经移除。",error.localizedDescription?:@"文件操作失败"]);
+        }];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+- (void)tableView:(UITableView *)table accessoryButtonTappedForRowWithIndexPath:(NSIndexPath *)path {
+    (void)table;
+    NSDictionary *game=_games[path.row];
+    UIAlertController *a=[UIAlertController alertControllerWithTitle:game[@"title"] message:@"管理此游戏" preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"清空游戏数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *){
+        [self dismissViewControllerAnimated:YES completion:^{[self confirmManageGame:game deleting:NO];}];
+    }]];
+    if(![game[@"id"] isEqualToString:@"builtin-demo"])
+        [a addAction:[UIAlertAction actionWithTitle:@"删除游戏" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *){
+            [self dismissViewControllerAnimated:YES completion:^{[self confirmManageGame:game deleting:YES];}];
+        }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)table trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)path {
+    (void)table; NSDictionary *game=_games[path.row];
+    NSMutableArray<UIContextualAction *> *actions=[NSMutableArray array];
+    if(![game[@"id"] isEqualToString:@"builtin-demo"]) {
+        [actions addObject:[UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除游戏" handler:^(UIContextualAction *,UIView *,void (^done)(BOOL)){
+            done(YES); [self confirmManageGame:game deleting:YES];
+        }]];
+    }
+    UIContextualAction *clear=[UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"清空数据" handler:^(UIContextualAction *,UIView *,void (^done)(BOOL)){
+        done(YES); [self confirmManageGame:game deleting:NO];
+    }];
+    clear.backgroundColor=UIColor.systemOrangeColor; [actions addObject:clear];
+    UISwipeActionsConfiguration *configuration=[UISwipeActionsConfiguration configurationWithActions:actions];
+    configuration.performsFirstActionWithFullSwipe=NO; return configuration;
 }
 - (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)path {
     [table deselectRowAtIndexPath:path animated:YES];

@@ -48,3 +48,29 @@
 用户提供的日志确认 NJSession.mm、AudioOutput.mm、App.mm 已通过编译，核心静态库已生成。失败推进到最终 arm64 链接：7 个 CG 前缀符号未解析，包括 CGImageCreate、CGColorSpaceCreateDeviceRGB 和 CGContextSetInterpolationQuality。原因是外层 CMake 未显式链接 CoreGraphics；已补上该框架。statusBarOrientation 的弃用提示是警告，不是本次失败原因。
 
 本次仍未生成 IPA。已归档日志至 build/logs/third-ios-build.txt，修复包为 dist/fix-003-coregraphics-link.zip，完整源码包同步更新。用户可直接再次运行 scripts/publish.ps1 上传最新文件；修复后的最终链接和 IPA 打包仍待 GitHub Actions 验证，本地 Windows 无 Apple SDK，不能代替云端验证。
+
+## 0.1.1（build 2）：虚拟按键响应修复
+
+用户反馈手机端虚拟按键卡顿、经常不响应；尚未收到具体游戏名或本次修复的真机结果。该反馈说明用户已在运行旧版，不能继续把整个项目描述为尚未上机，也不能据此推断所有游戏或功能通过验收。
+
+代码检查发现：按键视觉缝隙也被当作触摸空白区，任意 layoutSubviews 都清空触摸，输入入队不唤醒 VM 的等待；另外画面复制和输入使用同一把锁，每帧重绘整个键盘。
+
+本地修改：独立完整单元格命中区域和 6 pt 持键容错；仅几何尺寸、缩放或逻辑分辨率实际改变时重置布局；输入通知条件变量并允许等待提前返回；仅合并相邻画面拖动事件，不丢弃按键按下/松开；帧快照单独加锁，UIKit 非阻塞取帧；游戏画面和键帽只标记需要刷新的区域。未改上游代码或自动连发语义。
+
+验证：找到本机 Visual Studio 18 / MSVC 14.51 工具链，使用 C++17 /W4 /WX 编译并运行 tests/controls_test.cpp，通过。覆盖横竖屏比例、按键缝隙、1000 次边缘抖动、滑动换键、多指共享按键和取消。命令及编译产物位于 build/test-controls.cmd、build/controls-test.exe；Apple/UIKit 编译和设备触摸行为仍需 Actions 及手机验证。修复源码包为 dist/fix-004-input-response.zip。
+
+## 0.1.2（build 3）：具体游戏诊断、列表管理与图标
+
+用户补充：内置演示无问题，其他游戏快速换键时会暂时不响应且不变绿；City Bloxx 菜单主要只响应软键。已只读检查 jars/ 中的 4 个游戏；这些文件不打包、不上传。
+
+City Bloxx 1.0.8 的 p 类继承 Nokia FullCanvas，通过接口 m 调用 getGameAction。原核心只有静态 Canvas 入口，接口分派的实例查找失败。本地 Windows 宿主用原核心成功复现同样的 AbstractMethodError。cmake/CoreCompatibility.cmake 生成单文件兼容副本，补充实例入口且保留静态入口；iOS 和 CI 主机核心均使用此补丁。上游固定源码未改。
+
+对照证据位于 build/city-baseline、build/city-fixed、build/city-quick-fixed、build/city-play-fixed。修复后未再出现 getGameAction 的 AbstractMethodError，截图确认可以下移到 Quick game、进入吊车场景、返回出现 Continue quick game 的菜单。30 秒回放尚不能证明楼块显示、完整玩法或持久化存档正确，仍有初始化时的 RecordStoreNotFoundException / 被处理的 NullPointerException；不把退出码 0 当作完整兼容证明。
+
+进一步输入修复：游戏帧由独立 UIImageView 合成；输入队列使用独立短锁，日志和 AVAudioPlayer 音量调用不再占用该锁；同键的快速按下/松开跨输入批次交付，不把一对短按在同一批中全部吞掉；保持相邻拖动合并和所有按键边沿。增加 UI_TOUCH、INPUT、UI_MAIN 延迟统计供手机复核。
+
+游戏管理：列表左滑或 ⓘ 入口，删除游戏/清空数据均确认后执行；内置演示只能清空 RMS。删除仅作用于对应 JAR、标题与 Saves/<id>；清空只删除对应 RMS。原有共享 Files 仍可被游戏访问且不会被删除，以免影响其他游戏。
+
+图标：采用用户下载的 HelloClyde/BBK9588-J2ME assets/icons/j2me-coffee.png（512x512 透明图），合成为白底，生成 iPhone AppIcon 资源及 1024x1024 图，接入 Xcode 资源编译；绿色背景 source 图未采用。
+
+本地通过：MSVC C++ 控件与输入队列测试；9 项 Canvas 接口/虚方法/静态方法键码查询实际 VM 测试；原核心演示两次启动和 RMS 回读；3 项 Python 图标/打包测试。Foundation 文件操作测试已加入 macOS CI，当前 Windows 不能运行。新 UIKit、图标打包和 0.1.2 真机效果仍待用户上传后验证。

@@ -2,6 +2,7 @@ upstream/
 build/
 dist/
 downloads/
+jars/
 .cache/
 __pycache__/
 *.ipa
