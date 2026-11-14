@@ -44,7 +44,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish.ps1
 `.gitignore` 已排除 upstream、下载目录、构建缓存、IPA 和 dist；不要用 `git add -f` 把整个上游复制进去。脚本使用你现有的 Git 登录和提交身份；如果缺少 user.name / user.email，请设置你自己的身份后重试。不会替你填写身份或修改全局 Git 配置。
 
 2. 打开仓库 **Actions → Build iOS IPA** 查看自动构建；也可点 **Run workflow** 手动触发。
-3. 成功后下载 **J2MEForIOS-build** artifact，解压得到 `J2MEForIOS-unsigned.ipa`。全部检查通过应为绿色；失败时 artifact 可能仅含日志，也可能有尚未通过后续检查的 IPA。
+3. 全部检查成功后下载 **J2MEForIOS-unsigned-IPA** artifact，解压得到 `J2MEForIOS-unsigned.ipa`。**J2MEForIOS-build-logs** 仅包含诊断日志，不是安装包；构建失败时请提供其中的 `build-ios.log`。
 4. 将 IPA 通过 TrollStore 安装。此构建不需要 Apple 开发者证书，没有申请 JIT 或私有权限。
 
 流程固定 macos-15 / Xcode 16.4，部署目标 iOS 15.5。runner 若移除这个 Xcode 版本，需显式调整工作流，不能盲目换最新版本。构建输出检查 Mach-O 的 arm64、iOS 真机平台和最低系统，避免误打模拟器包。

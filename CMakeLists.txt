@@ -19,6 +19,10 @@ add_subdirectory("${CORE}" core)
 # Darwin hides MAP_ANONYMOUS in that strict mode unless its extensions are
 # explicitly enabled. This port is compiled even with JIT disabled.
 target_compile_definitions(nj2me PRIVATE _DARWIN_C_SOURCE=1)
+# nj_config.h includes nj_libc.h before assigning NJ_USE_LIBC its default.
+# Set it on the command line so the core and its ObjC++ consumers use Apple's
+# hosted headers instead of the freestanding C declarations.
+target_compile_definitions(nj2me PUBLIC NJ_USE_LIBC=1)
 set(DEMO "${UPSTREAM}/assets/korvo_demo.jar")
 set(CORE_LICENSE "${CORE}/LICENSE")
 set_source_files_properties("${DEMO}" "${CORE_LICENSE}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)

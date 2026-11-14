@@ -15,6 +15,30 @@
 - 核心演示两次启动及 RMS 回归（已加入 CI）。
 - TrollStore 安装与 iPhone 13 真机测试。
 
-下一步：将项目上传到用户自己的 GitHub 仓库，运行 Build iOS IPA。依据首次编译日志修复构建问题，随后安装并完成 README 中的首轮手机验收。当前没有生成或验证真实 IPA。
+2026-11-14 16:02（北京时间）：已通过网页上传基础配置、iOS 实现、scripts、tests 和 Actions 工作流，保留初始化提交历史。工作流提交 4076aa76be85d45d564e3f4359dbacba03b465d5。
 
-上传准备：用户指定 jaychou031/j2meforios，网页确认 main 当前仅含初始化 README（cb9e2db）。本机 Git 远程连接被重置，内置浏览器尚未登录；当前尚未上传。提供 scripts/publish.ps1，使用用户正常 PowerShell 的网络与现有 Git 登录，在项目 build 子目录克隆后追加提交，保留远端历史。
+首次构建：Build iOS IPA #1，run ID 43573879354。最后观察到的状态为 In progress；尚未确认结果，也没有下载或验证真实 IPA。
+
+用户明确要求后续所有网页操作由用户完成。后续只在本地准备修改、测试和上传包，等待用户提供构建结果/错误日志，不再自动操作网页。
+
+下一步：用户查看 Actions 的首次结果。失败时提供失败步骤的完整日志或 build-ios.log；成功时下载产物，并进行 README 中的 TrollStore 安装和首轮手机验收。
+
+本机 Git 远程连接曾被重置。scripts/publish.ps1 是可选的手动上传辅助：使用用户正常 PowerShell 的网络与已有 Git 登录，在本项目 build 子目录克隆后追加提交，不强制推送。
+
+## 首次构建日志修复
+
+用户提供的日志确认 Xcode 16.4 已开始编译 iOS arm64 核心，失败于 nj_port_headless.c:256 的 MAP_ANONYMOUS 未定义。日志中的 typedef 重复定义为警告，不是此次失败原因。
+
+本地修复：根 CMakeLists.txt 为 nj2me 目标增加 _DARWIN_C_SOURCE=1；Actions 中独立 macOS 核心构建增加相同定义，避免后续冒烟测试遇到同一问题。JIT 仍关闭，上游源码未修改。
+
+修复包：dist/fix-001-darwin-build.zip，仅包含 CMakeLists.txt 和 .github/workflows/ios.yml。需要用户上传后重新运行 Actions 验证；Windows 本地没有 Apple SDK，尚不能确认修复后的 iOS 编译结果。
+
+## 第二次日志与 IPA 缺失修复
+
+用户提供的第二次日志仍为 BUILD FAILED：NJSession.mm 引入 nj_libc.h 时，tolower/toupper 的语言链接声明与 Apple 系统头文件冲突。上游 nj_config.h 在设置 NJ_USE_LIBC 默认值前包含 nj_libc.h，导致首次包含时错误进入裸机声明分支。外层 CMake 为 nj2me 及使用方 PUBLIC 定义 NJ_USE_LIBC=1；独立 macOS 核心测试也明确使用同一定义。上游文件未修改。
+
+此前工作流的日志管道未明确启用 pipefail，iOS 编译失败后仍执行了核心测试。现在显式使用 bash 和 set -euo pipefail，并检查 IPA 非空；安装包与日志分别上传，缺少 IPA 时不会以日志冒充成功产物。
+
+用户粘贴的两次主机演示日志确认 DEMO_RMS_BOOT 从 1 变为 2、按键 53 的按下和释放、destroyApp 清理均执行成功。这证明该次 macOS 核心测试通过，不证明 iOS 编译或手机运行成功。
+
+修复包：dist/fix-002-ios-libc-and-ci.zip。仍需用户上传后通过 Apple 云端编译，再进行 TrollStore 安装与真机验收。
