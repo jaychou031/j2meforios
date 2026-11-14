@@ -35,6 +35,7 @@ jobs:
       - name: Run actual core demo and persistence smoke test
         run: |
           cmake -S upstream/esp32s31-korvo-nano-j2me/third_party/nano_j2me -B build/core-host \
+            -DCMAKE_C_FLAGS=-D_DARWIN_C_SOURCE=1 \
             -DNJ_BUILD_TESTS=OFF -DNJ_BUILD_SDL2=OFF -DNJ_BUILD_CLI=ON \
             -DNJ_BUILD_LIBRETRO=OFF -DNJ_BUILD_EMBEDDED_PORTS=OFF \
             -DNJ_BUILD_POSIX_NETWORK=OFF -DNJ_ENABLE_MEDIA=1 \
@@ -50,4 +51,3 @@ jobs:
             build-ios.log
             build/demo-boot-*.log
           if-no-files-found: warn
-
